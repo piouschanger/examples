@@ -1,0 +1,11 @@
+import requests
+
+url = 'https://api.apiopen.top/getSongPoetry?page=1&count=20'
+r = requests.get(url)
+response = r.json()
+dicts = response['result']
+for i in range(len(dicts)):
+    dict = dicts[i]
+    for key in sorted(dict.keys()):
+        content = dict['content']
+    print(content)
