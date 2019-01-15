@@ -1,0 +1,178 @@
+#第一步：导入必要的库
+import pandas as pd
+import numpy as np
+from sklearn.cross_validation import train_test_split
+
+#第二步：导入数据
+german = pd.read_csv('D:/CreditDatasets/german.data', sep=' ', header=None)
+german.columns = ['Status_of_existing_checking_account', 'Duration_in_month', 'Credit_history','Purpose', 'Credit_amount', 'Savings_account', 'Present_employment_since','Installment_rate', 'Personal_status_and_sex', 'Other_debtors', 'Present_residence_since','Property', 'Age', 'Other_installment_plans', 'Housing', 'Number_of_existing_credits','Job', 'Number_of_people', 'Telephone', 'foreign_worker', 'default']
+Grp = german.groupby('default')
+total_good = Grp.size()[1]
+total_bad = Grp.size()[2]
+
+#第三步：分别计算名义变量和数值变量的woe值，对取值较少的数值变量也用名义变量woe计算方法实现，其余数值变量均5等分
+def CalcWOE(VarName):
+    WOE_Map = pd.DataFrame()
+    Vars = np.unique(german[VarName])
+    for v in Vars:
+        tmp = german[VarName] == v
+        grp = german[tmp].groupby('default')
+        Good = grp.size()[1]
+        Bad = grp.size()[2]
+        good_ratio = float(Good)/total_good
+        bad_ratio = float(Bad)/total_bad
+        WOE = np.log(bad_ratio/good_ratio)
+        IV = (bad_ratio - good_ratio)*WOE
+        result = pd.DataFrame([[VarName, v, WOE, IV]], index=None, columns=['variable', 'class', 'woe', 'iv'])
+        WOE_Map = WOE_Map.append(result, ignore_index=True)
+    return WOE_Map
+ 
+# nominal variable woe
+status_checking_account_woe = CalcWOE('Status_of_existing_checking_account')
+Credit_history_woe          = CalcWOE('Credit_history')
+Purpose_woe                 = CalcWOE('Purpose')
+Savings_account_woe         = CalcWOE('Savings_account')
+Present_employment_since_woe= CalcWOE('Present_employment_since')
+Personal_status_and_sex_woe = CalcWOE('Personal_status_and_sex')
+Other_debtors_woe           = CalcWOE('Other_debtors')
+Property_woe                = CalcWOE('Property')
+Other_installment_plans_woe = CalcWOE('Other_installment_plans')
+Housing_woe                 = CalcWOE('Housing')
+Job_woe                     = CalcWOE('Job')
+Telephone_woe               = CalcWOE('Telephone')
+foreign_worker_woe          = CalcWOE('foreign_worker')
+ 
+# numeric variable woe, no binning
+Installment_rate_woe        = CalcWOE('Installment_rate')
+Present_residence_since_woe = CalcWOE('Present_residence_since')
+Number_of_existing_credits_woe = CalcWOE('Number_of_existing_credits')
+Number_of_people_woe        = CalcWOE('Number_of_people')
+ 
+ 
+def CalcWOE_bin(VarName,N):
+    WOE_Map = pd.DataFrame()
+    max_value = max(german[VarName])
+    min_value = min(german[VarName])
+    bin = float(max_value - min_value)/N
+    for i in range(N):
+        bin_U = min_value + (i+1)*bin
+        bin_L = bin_U - bin
+        if i == 1:
+            tmp = (german[VarName] >= bin_L) & (german[VarName] <= bin_U)
+            grp = german[tmp].groupby('default')
+        else:
+            tmp = (german[VarName] > bin_L) & (german[VarName] <= bin_U)
+            grp = german[tmp].groupby('default')
+        Good = grp.size()[1]
+        Bad = grp.size()[2]
+        good_ratio = float(Good)/total_good
+        bad_ratio = float(Bad)/total_bad
+        WOE = np.log(bad_ratio/good_ratio)
+        IV = (bad_ratio - good_ratio)*WOE
+        result = pd.DataFrame([[VarName, [bin_L, bin_U, WOE], WOE, IV]],
+                              index=None, columns=['variable', 'class+woe', 'woe', 'iv'])
+        WOE_Map = WOE_Map.append(result, ignore_index=True)
+    return WOE_Map
+ 
+Duration_in_month_woe = CalcWOE_bin('Duration_in_month', 5)
+Credit_amount_woe     = CalcWOE_bin('Credit_amount', 5)
+Age_woe               = CalcWOE_bin('Age', 5)
+
+#第四步：用woe值替代原来的值
+def ReplaceWOE(VarName, SourceDF, VarWOE):
+    dict1 = dict.fromkeys(VarWOE['class'])
+    j = 0
+    for key in dict1:
+        dict1[key] = VarWOE['woe'][j]
+        j = j + 1
+    SourceDF[VarName] = SourceDF[VarName].map(dict1)
+    return SourceDF
+ 
+german_woe = german
+temp = ReplaceWOE('Status_of_existing_checking_account', german_woe, status_checking_account_woe)
+temp1 = ReplaceWOE('Credit_history', temp, Credit_history_woe)
+temp = ReplaceWOE('Purpose', temp1, Purpose_woe)
+temp1 = ReplaceWOE('Savings_account', temp, Savings_account_woe)
+temp = ReplaceWOE('Present_employment_since', temp1, Present_employment_since_woe)
+temp1 = ReplaceWOE('Personal_status_and_sex', temp, Personal_status_and_sex_woe)
+temp = ReplaceWOE('Other_debtors', temp1, Other_debtors_woe)
+temp1 = ReplaceWOE('Property', temp, Property_woe)
+temp = ReplaceWOE('Other_installment_plans', temp1, Other_installment_plans_woe)
+temp1 = ReplaceWOE('Housing', temp, Housing_woe)
+temp = ReplaceWOE('Job', temp1, Job_woe)
+temp1 = ReplaceWOE('Telephone', temp, Telephone_woe)
+temp = ReplaceWOE('foreign_worker', temp1, foreign_worker_woe)
+ 
+temp1 = ReplaceWOE('Installment_rate', temp, Installment_rate_woe)
+temp = ReplaceWOE('Present_residence_since', temp1, Present_residence_since_woe)
+temp1 = ReplaceWOE('Number_of_existing_credits', temp, Number_of_existing_credits_woe)
+temp = ReplaceWOE('Number_of_people', temp1, Number_of_people_woe)
+ 
+def ReplaceWOE_bin(VarName, SourceDF, VarWOE):
+    items = np.unique(SourceDF[VarName])
+    m = min(SourceDF[VarName])
+    dict2 = {}
+    for it in items:
+        if it == m:
+            dict2[it] = VarWOE['class+woe'][0][2]
+        else:
+            for l, u, w in VarWOE['class+woe']:
+                if (it > l) & (it <= u):
+                    dict2[it] = w
+    SourceDF[VarName] = SourceDF[VarName].map(dict2)
+    return SourceDF
+ 
+temp1 = ReplaceWOE_bin('Duration_in_month', temp, Duration_in_month_woe)
+temp = ReplaceWOE_bin('Credit_amount', temp1, Credit_amount_woe)
+temp1 = ReplaceWOE_bin('Age', temp, Age_woe)
+
+#第五步：将数据集拆分为训练集和测试集
+X = temp1[list(temp1.columns)[:-1]]
+y = temp1['default'] - 1
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, random_state=0)
+
+#第六步：在训练集上应用logistic regression算法
+from sklearn.linear_model.logistic import LogisticRegression
+classifier = LogisticRegression()
+classifier.fit(X_train, y_train)
+predictions = classifier.predict(X_test)
+
+#第七步：评估模型分类精度
+from sklearn.metrics import accuracy_score
+# print 'Accuracy:', accuracy_score(y_test, predictions)
+ 
+from sklearn.cross_validation import cross_val_score
+scores = cross_val_score(classifier, X_train, y_train, cv=5)
+# print np.mean(scores), scores
+
+#第八步：创建评分卡
+# score = A - B*log(theta)
+# P0 = A - B*log(theta0), P0 + PDO = A - B*log(2*theta0)
+P0 = 600
+PDO = 20
+theta0 = 1.0/60
+B = PDO/np.log(2)
+A = P0 + B*np.log(theta0)
+coef = classifier.coef_
+beta0 = classifier.intercept_
+ 
+status_checking_account_woe['score'] = (A - B*beta0)/20 - B*coef[0][0]*status_checking_account_woe['woe']
+Duration_in_month_woe['score'] = (A - B*beta0)/20 - B*coef[0][1]*Duration_in_month_woe['woe']
+Credit_history_woe['score'] = (A - B*beta0)/20 - B*coef[0][2]*Credit_history_woe['woe']
+Purpose_woe['score'] = (A - B*beta0)/20 - B*coef[0][3]*Purpose_woe['woe']
+Credit_amount_woe['score'] = (A - B*beta0)/20 - B*coef[0][4]*Credit_amount_woe['woe']
+Savings_account_woe['score'] = (A - B*beta0)/20 - B*coef[0][5]*Savings_account_woe['woe']
+Present_employment_since_woe['score'] = (A - B*beta0)/20 - B*coef[0][6]*Present_employment_since_woe['woe']
+Installment_rate_woe['score'] = (A - B*beta0)/20 - B*coef[0][7]*Installment_rate_woe['woe']
+Personal_status_and_sex_woe['score'] = (A - B*beta0)/20 - B*coef[0][8]*Personal_status_and_sex_woe['woe']
+Other_debtors_woe['score'] = (A - B*beta0)/20 - B*coef[0][9]*Other_debtors_woe['woe']
+Present_residence_since_woe['score'] = (A - B*beta0)/20 - B*coef[0][10]*Present_residence_since_woe['woe']
+Property_woe['score'] = (A - B*beta0)/20 - B*coef[0][11]*Property_woe['woe']
+Age_woe['score'] = (A - B*beta0)/20 - B*coef[0][12]*Age_woe['woe']
+Other_installment_plans_woe['score'] = (A - B*beta0)/20 - B*coef[0][13]*Other_installment_plans_woe['woe']
+Housing_woe['score'] = (A - B*beta0)/20 - B*coef[0][14]*Housing_woe['woe']
+Number_of_existing_credits_woe['score'] = (A - B*beta0)/20 - B*coef[0][15]*Number_of_existing_credits_woe['woe']
+Job_woe['score'] = (A - B*beta0)/20 - B*coef[0][16]*Job_woe['woe']
+Number_of_people_woe['score'] = (A - B*beta0)/20 - B*coef[0][17]*Number_of_people_woe['woe']
+Telephone_woe['score'] = (A - B*beta0)/20 - B*coef[0][18]*Telephone_woe['woe']
+foreign_worker_woe['score'] = (A - B*beta0)/20 - B*coef[0][19]*foreign_worker_woe['woe']
