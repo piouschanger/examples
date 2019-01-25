@@ -1,0 +1,101 @@
+import pandas as pd
+import numpy as np
+
+
+#画图plt里面中文显示
+mpl.rcParams['font.sans-serif'] = ['SimHei']
+mpl.rcParams['axes.unicode_minus'] = False
+
+#导入数据
+df = pd.read_csv('C:/Users/Wu Ran/Desktop/youfen_test.csv')
+df.describe().to_csv('DataDescribe.csv')
+df
+
+#WOE值计算
+cut1=pd.qcut(df["sale"],4,labels=False)
+cut2=pd.qcut(df["app"],4,labels=False)
+rate=df["y"].sum()/(df["y"].count()-df["y"].sum())
+def get_woe_data(cut):
+    grouped=df["y"].groupby(cut,as_index = True).value_counts()
+    woe=np.log(grouped.unstack().iloc[:,1]/grouped.unstack().iloc[:,0]/rate)
+    return woe
+cut1_woe=get_woe_data(cut1)
+cut2_woe=get_woe_data(cut2)
+
+import matplotlib.pyplot as plt
+cut1_woe.plot.bar(color='b',alpha=0.3,rot=0)
+
+#IV值计算
+def get_IV_data(cut,cut_woe):
+    grouped=df["y"].groupby(cut,as_index = True).value_counts()
+    cut_IV=((grouped.unstack().iloc[:,1]/df["y"].sum()-grouped.unstack().iloc[:,0]/(df["y"].count()-df["y"].sum()))*cut_woe).sum()    
+    return cut_IV
+#计算各分组的IV值
+cut1_IV=get_IV_data(cut1,cut1_woe)
+cut2_IV=get_IV_data(cut2,cut2_woe)
+
+IV=pd.DataFrame([cut1_IV,cut2_IV],index=['sale','app'],columns=['IV'])
+iv=IV.plot.bar(color='b',alpha=0.3,rot=30,figsize=(10,5),fontsize=(10))
+iv.set_title('特征变量与IV值分布图',fontsize=(15))
+iv.set_xlabel('特征变量',fontsize=(15))
+iv.set_ylabel('IV',fontsize=(15))
+
+IV
+
+#WOE值替换
+df_new=pd.DataFrame()   #新建df_new存放woe转换后的数据
+def replace_data(cut,cut_woe):
+    a=[]
+    for i in cut.unique():
+        a.append(i)
+        a.sort()
+    for m in range(len(a)):
+        cut.replace(a[m],cut_woe.values[m],inplace=True)
+    return cut
+df_new["y"]=df["y"]
+df_new["sale"]=replace_data(cut1,cut1_woe)
+df_new["app"]=replace_data(cut2,cut2_woe)
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+x = df_new.iloc[:,1:]
+y = df_new.iloc[:,:1]
+x_train,x_test,y_train,y_test = train_test_split(x,y,test_size=0.3,random_state=0)
+model = LogisticRegression()
+clf = model.fit(x_train,y_train)
+print('测试成绩：{}'.format(clf.score(x_test,y_test)))
+
+coe=clf.coef_        #特征权值系数，后面转换为打分规则时会用到
+coe
+
+y_pred=clf.predict(x_test)
+
+#ROC曲线
+from sklearn.metrics import roc_curve, auc
+fpr, tpr, threshold = roc_curve(y_test, y_pred)
+roc_auc = auc(fpr, tpr)
+plt.plot(fpr, tpr, color='darkorange',label='ROC curve (area = %0.2f)' % roc_auc)
+plt.plot([0, 1], [0, 1], color='navy',  linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.0])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC_curve')
+plt.legend(loc="lower right")
+plt.show()
+
+#KS图
+fig, ax = plt.subplots()
+ax.plot(1 - threshold, tpr, label='tpr') # ks曲线要按照预测概率降序排列，所以需要1-threshold镜像
+ax.plot(1 - threshold, fpr, label='fpr')
+ax.plot(1 - threshold, tpr-fpr,label='KS')
+plt.xlabel('score')
+plt.title('KS Curve')
+plt.ylim([0.0, 1.0])
+plt.figure(figsize=(20,20))
+legend = ax.legend(loc='upper left')
+plt.show()
+
+#KS值
+max(tpr-fpr)
+
