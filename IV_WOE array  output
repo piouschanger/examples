@@ -1,0 +1,138 @@
+import pandas as pd
+import numpy as np
+
+df = pd.read_csv('C:/Users/Wu Ran/Desktop/youfen_test.csv')
+df.describe().to_csv('DataDescribe.csv')
+df.head()
+
+#好坏样本
+Grp = df.groupby('y')
+total_bad = Grp.size()[0]
+total_good = Grp.size()[1]
+print(total_bad)
+print(total_good)
+
+#单个变量iv,woe
+import scipy.stats as stats
+def woe_single(DF,Y,X):
+    if X.nunique()>7:
+        r = 0
+        bad = total_good      #坏客户数(假设因变量列为1的是好客户（逾期的人）)
+        good = total_bad #好客户数
+        n=6
+        while np.abs(r) < 1:
+            d1 = pd.DataFrame({"X": X, "Y": Y, "Bucket": pd.qcut(X, n,duplicates='drop')})
+            d2 = d1.groupby('Bucket', as_index = False)
+            r, p = stats.spearmanr(d2.mean().X, d2.mean().Y)
+            n = n - 1
+        d3 = pd.DataFrame(d2.X.min(), columns = ['min'])
+        d3['min']=d2.min().X    
+        d3['max'] = d2.max().X
+        d3['sum'] = d2.sum().Y
+        d3['total'] = d2.count().Y
+        d3['bad_rate'] = d2.mean().Y
+        d3['group_rate']=d3['total']/(bad+good)
+        d3['woe']=np.log((d3['bad_rate']/(1-d3['bad_rate']))/(bad/good))
+        d3['iv']=(d3['sum']/bad-((d3['total']-d3['sum'])/good))*d3['woe']
+        iv=d3['iv'].sum()
+        if iv!=0.0 and len(d2)>1:
+            d3['iv_sum']=iv
+            woe=list(d3['woe'].round(6))
+            cut=list(d3['min'].round(6))
+            cut1=list(d3['max'].round(6))
+            cut.append(cut1[-1]+1)
+            x_woe=pd.cut(X,cut,right=False,labels=woe)
+            return  d3,cut,woe,iv,x_woe
+        else:
+            dn1 = pd.DataFrame({"X": X, "Y": Y, "Bucket": pd.cut(X, 10000)})
+            dn2 = dn1.groupby('Bucket', as_index = False)
+            dn3 = pd.DataFrame(dn2.X.min(), columns = ['min'])
+            dn3['min']=dn2.min().X    
+            dn3['max'] = dn2.max().X
+            dn3['sum'] = dn2.sum().Y
+            dn3['total'] = dn2.count().Y
+            dn3=dn3.dropna()
+            dn3= dn3.reset_index(drop=True)
+            while (1):
+                    if  (len(dn3)>4):
+                        dn3_min_index = dn3[dn3.total == min(dn3.total)].index.values[0]
+                        if (dn3_min_index!=0):    #最小值非第一行的情况
+                            dn3.iloc[dn3_min_index-1, 1] =dn3.iloc[dn3_min_index, 1] 
+                            dn3.iloc[dn3_min_index-1, 2] = dn3.iloc[dn3_min_index, 2] +dn3.iloc[dn3_min_index-1, 2]
+                            dn3.iloc[dn3_min_index-1, 3] = dn3.iloc[dn3_min_index, 3] +dn3.iloc[dn3_min_index-1, 3]
+                            dn3=dn3.drop([dn3_min_index])
+                            dn3= dn3.reset_index(drop=True)
+                        else:    #最小值是第一行的情况
+                            dn3.iloc[dn3_min_index+1, 0] =dn3.iloc[dn3_min_index, 0] 
+                            dn3.iloc[dn3_min_index+1, 2] = dn3.iloc[dn3_min_index, 2] +dn3.iloc[dn3_min_index+1, 2]
+                            dn3.iloc[dn3_min_index+1, 3] = dn3.iloc[dn3_min_index, 3] +dn3.iloc[dn3_min_index+1, 3]
+                            dn3=dn3.drop([dn3_min_index])
+                            dn3= dn3.reset_index(drop=True)
+                    else:
+                        break
+            dn3['bad_rate'] =dn3['sum']/dn3['total']
+            dn3['group_rate']=dn3['total']/(bad+good)
+            dn3['woe']=np.log((dn3['bad_rate']/(1-dn3['bad_rate']))/(bad/good))
+            dn3['iv']=(dn3['sum']/bad-((dn3['total']-dn3['sum'])/good))*dn3['woe']
+            
+            iv=dn3['iv'].sum()
+            dn3['iv_sum']=iv
+            woe=list(dn3['woe'].round(6)) 
+            cut=list(dn3['min'].round(6))
+            cut1=list(dn3['max'].round(6))
+            cut.append(cut1[-1]+1)
+            x_woe=pd.cut(X,cut,right=False,labels=woe)
+            return  dn3,cut,woe,iv,x_woe
+    else : 
+        bad = total_good      #坏客户数(假设因变量列为1的是好客户（逾期的人）)
+        good = total_bad #好客户数
+        d1 = pd.DataFrame({"X": X, "Y": Y})
+        d2 = d1.groupby('X', as_index =True)
+        d3 = pd.DataFrame()
+        
+        d3['sum'] = d2.sum().Y
+        d3['total'] = d2.count().Y
+        for c in range(d3.shape[0])[::-1]:
+            if ((d3.iloc[c,1]-d3.iloc[c,0])==0) or (d3.iloc[c,0]==0):
+                d3.iloc[c-1,0]=d3.iloc[c-1,0]+d3.iloc[c,0]
+                d3.iloc[c-1,1]=d3.iloc[c-1,1]+d3.iloc[c,1]
+                d3.drop(d3.index[c],inplace=True)
+            else:
+                continue
+        
+        d3['min']=d3.index  
+        d3['max'] = d3.index
+        d3['bad_rate'] =d3['sum']/d3['total']
+        d3['group_rate']=d3['total']/(bad+good)
+        d3['woe']=np.log((d3['bad_rate']/(1-d3['bad_rate']))/(bad/good))
+        d3['iv']=(d3['sum']/bad-((d3['total']-d3['sum'])/good))*d3['woe']
+        iv=d3['iv'].sum()
+        d3['iv_sum']=iv
+        d3= d3.reset_index(drop=True)
+        d3=d3[['min','max','sum','total','bad_rate','group_rate','woe','iv','iv_sum']]
+        
+        
+        woe=list(d3['woe'].round(6))
+        cut=list(d3.index)
+        x_woe=X.replace(cut,woe)
+        return d3,cut,woe,iv,x_woe
+        
+    woe_single(df, df.y, df.sale)[0] #整体分箱woe、iv情况    
+    
+    woe_single(df, df.y, df.sale)[1] #分割点
+    
+    woe_single(df, df.y, df.sale)[2] #woe
+    
+    woe_single(df, df.y, df.sale)[3] #iv
+    
+    #查看所有变量分箱、woe、iv等情况
+woe=pd.DataFrame(columns=['min','max','sum','total','bad_rate','group_rate','woe','iv','iv_sum'])
+for i in df.columns[:2]:
+    w=pd.DataFrame(index=[i])
+    w=pd.concat([w,woe_single(df,df.y,df[i])[0]])
+    frames = [woe,w]
+    woe=pd.concat(frames)
+woe=woe[['min','max','sum','total','bad_rate','group_rate','woe','iv','iv_sum']]     #所有变量输出
+woe
+    
+    
