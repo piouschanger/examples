@@ -1,0 +1,389 @@
+import pandas as pd
+import numpy as np
+df = pd.read_csv('C:/Users/Wu Ran/Desktop/model_13.csv')
+df.describe().to_csv('DataDescribe.csv')
+df.head()
+
+
+# -*- coding: utf-8 -*-
+#卡方分箱
+def ChiMerge(df,variable,flag,confidenceVal=3.841,bin=10,sample=None):  
+    '''
+    param df:DataFrame| 必须包含标签列
+    param variable:str| 需要卡方分箱的变量名称（字符串）
+    param flag:str    | 正负样本标识的名称（字符串）
+    param confidenceVal:float| 置信度水平（默认是不进行抽样95%）
+    param bin：int            | 最多箱的数目
+    param sample: int          | 为抽样的数目（默认是不进行抽样），因为如果观测值过多运行会较慢
+    note: 停止条件为大于置信水平且小于bin的数目
+    return :DataFrame|采样结果
+    '''    
+    import pandas as pd
+    import numpy as np
+    
+    
+    #进行是否抽样操作
+    if sample != None:
+        df = df.sample(n=sample)
+    else:
+        df   
+        
+    #进行数据格式化录入
+    total_num = df.groupby([variable])[flag].count()  #统计需分箱变量每个值数目
+    total_num = pd.DataFrame({'total_num': total_num})  #创建一个数据框保存之前的结果
+    positive_class = df.groupby([variable])[flag].sum()  #统计需分箱变量每个值正样本数
+    positive_class = pd.DataFrame({'positive_class': positive_class})  #创建一个数据框保存之前的结果
+    regroup = pd.merge(total_num, positive_class, left_index=True, right_index=True,
+                       how='inner')  # 组合total_num与positive_class
+    regroup.reset_index(inplace=True)
+    regroup['negative_class'] = regroup['total_num'] - regroup['positive_class']  #统计需分箱变量每个值负样本数
+    regroup = regroup.drop('total_num', axis=1)
+    np_regroup = np.array(regroup)  #把数据框转化为numpy（提高运行效率）
+    #print('已完成数据读入,正在计算数据初处理')
+
+    #处理连续没有正样本或负样本的区间，并进行区间的合并（以免卡方值计算报错）
+    i = 0
+    while (i <= np_regroup.shape[0] - 2):
+        if ((np_regroup[i, 1] == 0 and np_regroup[i + 1, 1] == 0) or ( np_regroup[i, 2] == 0 and np_regroup[i + 1, 2] == 0)):
+            np_regroup[i, 1] = np_regroup[i, 1] + np_regroup[i + 1, 1]  # 正样本
+            np_regroup[i, 2] = np_regroup[i, 2] + np_regroup[i + 1, 2]  # 负样本
+            np_regroup[i, 0] = np_regroup[i + 1, 0]
+            np_regroup = np.delete(np_regroup, i + 1, 0)
+            i = i - 1
+        i = i + 1
+ 
+    #对相邻两个区间进行卡方值计算
+    chi_table = np.array([])  # 创建一个数组保存相邻两个区间的卡方值
+    for i in np.arange(np_regroup.shape[0] - 1):
+        chi = (np_regroup[i, 1] * np_regroup[i + 1, 2] - np_regroup[i, 2] * np_regroup[i + 1, 1]) ** 2 \
+          * (np_regroup[i, 1] + np_regroup[i, 2] + np_regroup[i + 1, 1] + np_regroup[i + 1, 2]) / \
+          ((np_regroup[i, 1] + np_regroup[i, 2]) * (np_regroup[i + 1, 1] + np_regroup[i + 1, 2]) * (
+          np_regroup[i, 1] + np_regroup[i + 1, 1]) * (np_regroup[i, 2] + np_regroup[i + 1, 2]))
+        chi_table = np.append(chi_table, chi)
+    #print('已完成数据初处理，正在进行卡方分箱核心操作')
+
+    #把卡方值最小的两个区间进行合并（卡方分箱核心）
+    while (1):
+        if (len(chi_table) <= (bin - 1) and min(chi_table) >= confidenceVal):
+            break
+        chi_min_index = np.argwhere(chi_table == min(chi_table))[0]  # 找出卡方值最小的位置索引
+        np_regroup[chi_min_index, 1] = np_regroup[chi_min_index, 1] + np_regroup[chi_min_index + 1, 1]
+        np_regroup[chi_min_index, 2] = np_regroup[chi_min_index, 2] + np_regroup[chi_min_index + 1, 2]
+        np_regroup[chi_min_index, 0] = np_regroup[chi_min_index + 1, 0]
+        np_regroup = np.delete(np_regroup, chi_min_index + 1, 0)
+
+        if (chi_min_index == np_regroup.shape[0] - 1):  # 最小值试最后两个区间的时候
+            # 计算合并后当前区间与前一个区间的卡方值并替换
+            chi_table[chi_min_index - 1] = (np_regroup[chi_min_index - 1, 1] * np_regroup[chi_min_index, 2] - np_regroup[chi_min_index - 1, 2] * np_regroup[chi_min_index, 1]) ** 2 \
+                                           * (np_regroup[chi_min_index - 1, 1] + np_regroup[chi_min_index - 1, 2] + np_regroup[chi_min_index, 1] + np_regroup[chi_min_index, 2]) / \
+                                       ((np_regroup[chi_min_index - 1, 1] + np_regroup[chi_min_index - 1, 2]) * (np_regroup[chi_min_index, 1] + np_regroup[chi_min_index, 2]) * (np_regroup[chi_min_index - 1, 1] + np_regroup[chi_min_index, 1]) * (np_regroup[chi_min_index - 1, 2] + np_regroup[chi_min_index, 2]))
+            # 删除替换前的卡方值
+            chi_table = np.delete(chi_table, chi_min_index, axis=0)
+
+        else:
+            # 计算合并后当前区间与前一个区间的卡方值并替换
+            chi_table[chi_min_index - 1] = (np_regroup[chi_min_index - 1, 1] * np_regroup[chi_min_index, 2] - np_regroup[chi_min_index - 1, 2] * np_regroup[chi_min_index, 1]) ** 2 \
+                                       * (np_regroup[chi_min_index - 1, 1] + np_regroup[chi_min_index - 1, 2] + np_regroup[chi_min_index, 1] + np_regroup[chi_min_index, 2]) / \
+                                       ((np_regroup[chi_min_index - 1, 1] + np_regroup[chi_min_index - 1, 2]) * (np_regroup[chi_min_index, 1] + np_regroup[chi_min_index, 2]) * (np_regroup[chi_min_index - 1, 1] + np_regroup[chi_min_index, 1]) * (np_regroup[chi_min_index - 1, 2] + np_regroup[chi_min_index, 2]))
+            # 计算合并后当前区间与后一个区间的卡方值并替换
+            chi_table[chi_min_index] = (np_regroup[chi_min_index, 1] * np_regroup[chi_min_index + 1, 2] - np_regroup[chi_min_index, 2] * np_regroup[chi_min_index + 1, 1]) ** 2 \
+                                       * (np_regroup[chi_min_index, 1] + np_regroup[chi_min_index, 2] + np_regroup[chi_min_index + 1, 1] + np_regroup[chi_min_index + 1, 2]) / \
+                                   ((np_regroup[chi_min_index, 1] + np_regroup[chi_min_index, 2]) * (np_regroup[chi_min_index + 1, 1] + np_regroup[chi_min_index + 1, 2]) * (np_regroup[chi_min_index, 1] + np_regroup[chi_min_index + 1, 1]) * (np_regroup[chi_min_index, 2] + np_regroup[chi_min_index + 1, 2]))
+            # 删除替换前的卡方值
+            chi_table = np.delete(chi_table, chi_min_index + 1, axis=0)
+    #print('已完成卡方分箱核心操作，正在保存结果')
+
+    #把结果保存成一个数据框
+    result_data = pd.DataFrame()  # 创建一个保存结果的数据框
+    result_data['variable'] = [variable] * np_regroup.shape[0]  # 结果表第一列：变量名
+    list_temp = []
+    for i in np.arange(np_regroup.shape[0]):
+        if i == 0:
+            x = '0' + ',' + str(np_regroup[i, 0])
+        elif i == np_regroup.shape[0] - 1:
+            x = str(np_regroup[i - 1, 0]) + '+'
+        else:
+            x = str(np_regroup[i - 1, 0]) + ',' + str(np_regroup[i, 0])
+        list_temp.append(x)
+    result_data['interval'] = list_temp  #结果表第二列：区间
+    result_data['flag_0'] = np_regroup[:, 2]  # 结果表第三列：负样本数目
+    result_data['flag_1'] = np_regroup[:, 1]  # 结果表第四列：正样本数目
+
+    return result_data
+
+
+
+##############################测试#############################################
+from sklearn.model_selection import train_test_split
+import seaborn as sn
+import pandas as pd
+
+df = pd.read_csv('C:/Users/Wu Ran/Desktop/model_1337.csv')
+result_data1 = ChiMerge(df=df,variable="bairong",flag="y",confidenceVal=1,bin=5,sample=None)
+result_data2 = ChiMerge(df=df,variable="3m_apply_count_mobile",flag="y",confidenceVal=1,bin=5,sample=None)
+result_data3 = ChiMerge(df=df,variable="mobileonlinetime",flag="y",confidenceVal=1,bin=5,sample=None)
+result_data4 = ChiMerge(df=df,variable="90_register_input_password",flag="y",confidenceVal=1,bin=5,sample=None)
+result_data5 = ChiMerge(df=df,variable="d7_to_use_time_calls_sum",flag="y",confidenceVal=1,bin=5,sample=None)
+result_data6 = ChiMerge(df=df,variable="d15_to_harass_use_time_calls_cnt",flag="y",confidenceVal=1,bin=5,sample=None)
+result_data7 = ChiMerge(df=df,variable="d7_to_calls_cnt",flag="y",confidenceVal=1,bin=5,sample=None)
+result_data8 = ChiMerge(df=df,variable="d15_to_night_calls_cnt",flag="y",confidenceVal=1,bin=5,sample=None)
+result_data9 = ChiMerge(df=df,variable="d15_pay_smss_cnt",flag="y",confidenceVal=1,bin=3,sample=None)
+result_data10 = ChiMerge(df=df,variable="d7_send_pay_smss_cnt",flag="y",confidenceVal=1,bin=5,sample=None)
+result_data11 = ChiMerge(df=df,variable="d90_180_send_operator_cnt",flag="y",confidenceVal=1,bin=5,sample=None)
+result_data1
+#result_data2
+
+result_data2
+
+result_data3
+
+
+
+import pandas as pd
+import numpy as np
+
+def self_bin(Y,X,cat):#自定义人工分箱函数
+    good=Y.sum()   #好用户数量
+    bad=Y.count()-good   # 坏用户数量
+    d1=pd.DataFrame({'X':X,'Y':Y,'Bucket':pd.cut(X,cat)}) #建立个数据框 X-- 各个特征变量 ， Y--用户好坏标签 ， Bucket--各个分箱
+    d2=d1.groupby('Bucket', as_index = True)     #  按分箱分组聚合 ，并且社会为 Index
+    d3 = pd.DataFrame(d2.X.min(), columns=['min'])  #  添加 min 列 ,不用管里面的 d2.X.min()
+    d3['min'] = d2.min().X    #求每个箱段内 X 比如 家庭人数的最小值
+    d3['max'] = d2.max().X    #求每个箱段内 X 比如 家庭人数的最大值
+    d3['sum'] = d2.sum().Y    #求每个箱段内 Y 好客户的个数
+    d3['total'] = d2.count().Y  #求每个箱段内  总共客户数
+    d3['rate'] = d2.mean().Y    # 好客户率
+    #WOE的全称是“Weight of Evidence”，即证据权重。WOE是对原始自变量的一种编码形式。是为了 计算 iv 准备的
+    #要对一个变量进行WOE编码，需要首先把这个变量进行分组处理（也叫离散化、分箱等等，说的都是一个意思）
+    d3['woe'] = np.log((d3['rate'] / (1 - d3['rate'])) / (good / bad))   
+    d3['goodattribute'] = d3['sum'] / good     # 每个箱段内 好用户 占 总好用户数  的 比率
+    d3['badattribute'] = (d3['total'] - d3['sum']) / bad  # 每个箱段内 坏用户 占 总坏用户数 的 比率
+    #IV的全称是Information Value，中文意思是信息价值，或者信息量。  通俗的说 就是 变量的预测能力
+    iv = ((d3['goodattribute'] - d3['badattribute']) * d3['woe']).sum()
+    d4 = (d3.sort_values(by='min'))   #数据框 的 按 min 升序排列
+    woe = list(d4['woe'].round(3))
+    return d4, iv,woe
+#对他们就行分箱处理：
+
+ninf=float('-inf')
+pinf=float('inf')
+cutx1=[ninf, 718,804,815,pinf]
+cutx2 = [ninf, -999,  pinf]
+cutx3 = [ninf, 2,3, pinf]
+cutx4 = [ninf, -999 , 0, 1, pinf]
+cutx5 = [ninf, 464, 714, pinf]
+cutx6 = [ninf, 4, pinf]
+cutx7 = [ninf,  5, 21, 48, pinf]
+cutx8 = [ninf, 2, 4, 9, pinf]
+cutx9 = [ninf, 1,  pinf]
+cutx10 = [ninf,1, 3, 11,pinf]
+cutx11 = [ninf,  1, 2, 38, pinf]
+#cutx12 = [ninf,  1, 2, 38, pinf]
+dfx1,ivx1,woex1 = self_bin(df['y'],df['bairong'], cutx1)
+dfx2,ivx2,woex2 = self_bin(df['y'],df['3m_apply_count_mobile'], cutx2)
+dfx3,ivx3,woex3 = self_bin(df['y'],df['mobileonlinetime'], cutx3)
+dfx4,ivx4,woex4= self_bin(df['y'],df['90_register_input_password'], cutx4)
+dfx5,ivx5,woex5= self_bin(df['y'],df['d7_to_use_time_calls_sum'], cutx5)
+dfx6,ivx6,woex6 = self_bin(df['y'],df['d15_to_harass_use_time_calls_cnt'], cutx6)
+dfx7,ivx7,woex7 = self_bin(df['y'],df['d7_to_calls_cnt'], cutx7)
+dfx8,ivx8,woex8 = self_bin(df['y'],df['d15_to_night_calls_cnt'], cutx8)
+dfx9,ivx9,woex9 = self_bin(df['y'],df['d15_pay_smss_cnt'], cutx9)
+dfx10,ivx10,woex10 = self_bin(df['y'],df['d7_send_pay_smss_cnt'], cutx10)
+dfx11,ivx11,woex11 = self_bin(df['y'],df['d90_180_send_operator_cnt'], cutx11)
+#dfx12,ivx12,woex12 = self_bin(df['y'],df['d90_180_send_operator_cnt'], cutx12)
+#dfx13,ivx13,woex13 = self_bin(df['y'],df['jobnature'], cutx13)
+dfx11,ivx11,woex11
+
+#画IV值柱状图
+import matplotlib.pyplot as plt  
+ivlist=[ivx1,ivx2,ivx3,ivx4,ivx5,ivx6,ivx7,ivx8,ivx9,ivx10,ivx11]#各变量IV
+index=['x1','x2','x3','x4','x5','x6','x7','x8','x9','x10','x11']#x轴的标签
+fig1 = plt.figure(1)
+ax1 = fig1.add_subplot(1, 1, 1)
+x = np.arange(len(index))+1
+ax1.bar(x, ivlist, width=0.4)#生成柱状图
+ax1.set_xticks(x)
+ax1.set_xticklabels(index, rotation=0, fontsize=12)
+ax1.set_ylabel('IV(Information Value)', fontsize=14)
+#在柱状图上添加数字标签
+for a, b in zip(x, ivlist):
+    plt.text(a, b + 0.01, '%.4f' % b, ha='center', va='bottom', fontsize=10)
+plt.show()
+
+#woe转换函数
+from pandas import Series
+def replace_woe(series,cut,woe):
+    list=[]
+    i=0
+    while i<len(series):
+        valuek=series[i]
+        j=len(cut)-2
+        m=len(cut)-2
+        while j>=0:
+            if valuek>=cut[j]:
+                j=-1
+            else:
+                j -=1
+                m -= 1
+        list.append(woe[m])
+        i += 1
+    return list
+
+
+#woe转换
+import pandas as pd
+import numpy as np
+# 替换成woe
+df['bairong'] = Series(replace_woe(df['bairong'], cutx1, woex1))
+df['3m_apply_count_mobile'] = Series(replace_woe(df['3m_apply_count_mobile'], cutx2, woex2))
+df['mobileonlinetime'] = Series(replace_woe(df['mobileonlinetime'], cutx3, woex3))
+df['90_register_input_password'] = Series(replace_woe(df['90_register_input_password'], cutx4, woex4))
+df['d7_to_use_time_calls_sum'] = Series(replace_woe(df['d7_to_use_time_calls_sum'], cutx5, woex5))
+df['d15_to_harass_use_time_calls_cnt'] = Series(replace_woe(df['d15_to_harass_use_time_calls_cnt'], cutx6, woex6))
+df['d7_to_calls_cnt'] = Series(replace_woe(df['d7_to_calls_cnt'], cutx7, woex7))
+df['d15_to_night_calls_cnt'] = Series(replace_woe(df['d15_to_night_calls_cnt'], cutx8, woex8))
+df['d15_pay_smss_cnt'] = Series(replace_woe(df['d15_pay_smss_cnt'], cutx9, woex9))
+df['d7_send_pay_smss_cnt'] = Series(replace_woe(df['d7_send_pay_smss_cnt'], cutx10, woex10))
+df['d90_180_send_operator_cnt'] = Series(replace_woe(df['d90_180_send_operator_cnt'], cutx11, woex11))
+
+df.to_csv('WoeData.csv', index=False)
+df.to_csv('C:/Users/Wu Ran/Desktop/model_data/woe1.csv', encoding = 'utf-8')
+
+
+#建立模型
+df = pd.read_csv('WoeData.csv')
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+Y=df['y']
+X=df.ix[:,1:]
+X_train,X_test,Y_train,Y_test=train_test_split(X,Y,test_size=0.3,random_state=0)
+train=pd.concat([Y_train,X_train],axis=1)
+test=pd.concat([Y_test,X_test],axis=1)
+
+
+#输出最终逻辑回归模型结果
+import numpy as np
+import statsmodels.api as sm
+from sklearn.linear_model import LogisticRegression
+data = pd.read_csv('WoeData.csv')
+import statsmodels.api as sm
+data[np.isnan(data)] = 0
+data[np.isinf(data)] = 0
+#应变量
+Y=data['y']
+#自变量，剔除对因变量影响不明显的变量
+X=data.drop(['y'],axis=1)
+X1=sm.add_constant(X) 
+logit=sm.Logit(Y,X1)
+result=logit.fit()
+print(result.summary())
+
+
+from sklearn.metrics import roc_curve,auc
+import matplotlib
+matplotlib.rcParams['font.sans-serif'] = ['FangSong']    # 指定默认字体
+matplotlib.rcParams['axes.unicode_minus'] = False
+Y_test=test['y']
+X_test=test.drop(['y'],axis=1)
+
+
+#画ROC曲线
+#通过ROC曲线和AUC来评估模型的拟合能力。
+X2=sm.add_constant(X_test)
+resu=result.predict(X2)
+
+fpr,tpr,threshold=roc_curve(Y_test,resu)
+# %f,%d,%s输出    
+rocauc=auc(fpr,tpr)
+plt.plot(fpr,tpr,'b',label='AUC=%0.2f'% rocauc)
+plt.title('ROC curve (AUC = %0.4f)' % rocauc, fontsize=25)
+plt.legend(loc='lower right')
+plt.plot([0,1],[0,1],'r--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.show()
+
+
+#画KS
+import pandas as pd
+def PlotKS(preds, labels, n, asc):
+    
+    # preds is score: asc=1
+    # preds is prob: asc=0
+    
+    pred = preds  # 预测值
+    bad = labels  # 取1为bad, 0为good
+    ksds = pd.DataFrame({'bad': bad, 'pred': pred})
+    ksds['good'] = 1 - ksds.bad
+    
+    if asc == 1:
+        ksds1 = ksds.sort_values(by=['pred', 'bad'], ascending=[True, True])
+    elif asc == 0:
+        ksds1 = ksds.sort_values(by=['pred', 'bad'], ascending=[False, True])
+    ksds1.index = range(len(ksds1.pred))
+    ksds1['cumsum_good1'] = 1.0*ksds1.good.cumsum()/sum(ksds1.good)
+    ksds1['cumsum_bad1'] = 1.0*ksds1.bad.cumsum()/sum(ksds1.bad)
+    
+    if asc == 1:
+        ksds2 = ksds.sort_values(by=['pred', 'bad'], ascending=[True, False])
+    elif asc == 0:
+        ksds2 = ksds.sort_values(by=['pred', 'bad'], ascending=[False, False])
+    ksds2.index = range(len(ksds2.pred))
+    ksds2['cumsum_good2'] = 1.0*ksds2.good.cumsum()/sum(ksds2.good)
+    ksds2['cumsum_bad2'] = 1.0*ksds2.bad.cumsum()/sum(ksds2.bad)
+    
+    # ksds1 ksds2 -> average
+    ksds = ksds1[['cumsum_good1', 'cumsum_bad1']]
+    ksds['cumsum_good2'] = ksds2['cumsum_good2']
+    ksds['cumsum_bad2'] = ksds2['cumsum_bad2']
+    ksds['cumsum_good'] = (ksds['cumsum_good1'] + ksds['cumsum_good2'])/2
+    ksds['cumsum_bad'] = (ksds['cumsum_bad1'] + ksds['cumsum_bad2'])/2
+    
+    # ks
+    ksds['ks'] = ksds['cumsum_bad'] - ksds['cumsum_good']
+    ksds['tile0'] = range(1, len(ksds.ks) + 1)
+    ksds['tile'] = 1.0*ksds['tile0']/len(ksds['tile0'])
+    
+    qe = list(np.arange(0, 1, 1.0/n))
+    qe.append(1)
+    qe = qe[1:]
+    
+    ks_index = pd.Series(ksds.index)
+    ks_index = ks_index.quantile(q = qe)
+    ks_index = np.ceil(ks_index).astype(int)
+    ks_index = list(ks_index)
+  
+
+
+
+    ksds = ksds.loc[ks_index]
+    ksds = ksds[['tile', 'cumsum_good', 'cumsum_bad', 'ks']]
+    ksds0 = np.array([[0, 0, 0, 0]])
+    ksds = np.concatenate([ksds0, ksds], axis=0)
+    ksds = pd.DataFrame(ksds, columns=['tile', 'cumsum_good', 'cumsum_bad', 'ks'])
+    
+    ks_value = ksds.ks.max()
+    ks_pop = ksds.tile[ksds.ks.idxmax()]
+    print ('ks_value is ' + str(np.round(ks_value, 4)) + ' at pop = ' + str(np.round(ks_pop, 4)))
+    
+    # chart
+    plt.plot(ksds.tile, ksds.cumsum_good, label='cum_good',
+                         color='blue', linestyle='-', linewidth=2)
+                         
+    plt.plot(ksds.tile, ksds.cumsum_bad, label='cum_bad',
+                        color='red', linestyle='-', linewidth=2)
+                        
+    plt.plot(ksds.tile, ksds.ks, label='ks',
+                   color='green', linestyle='-', linewidth=2)
+                       
+    plt.axvline(ks_pop, color='gray', linestyle='--')
+    plt.axhline(ks_value, color='green', linestyle='--')
+    plt.axhline(ksds.loc[ksds.ks.idxmax(), 'cumsum_good'], color='blue', linestyle='--')
+    plt.axhline(ksds.loc[ksds.ks.idxmax(),'cumsum_bad'], color='red', linestyle='--')
+    plt.title('KS=%s ' %np.round(ks_value, 4) +  
+                'at Pop=%s' %np.round(ks_pop, 4), fontsize=25)
+    
+
+    return ksds,
+
+PlotKS(preds=resu, labels=Y_test, n=5, asc=0)
