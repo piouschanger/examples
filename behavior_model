@@ -1,0 +1,724 @@
+--name:bh
+--author:Wu Ran
+--create time:2020-06-29 15:03
+--客群分类
+drop table if exists  FBD_CUSTOMER_TYPE_20200629_WR;
+create table FBD_CUSTOMER_TYPE_20200629_WR as
+  select distinct a.*,
+                  case when systemchannelflag='fubaodai_whitelist' then '公租房白名单'
+                       when systemchannelflag in ('fubaodai_transform_employee','fubaodai_transform_socialite') then '非富转富'
+                       when systemchannelflag = 'yousudai' then '优速贷'
+                       when systemchannelflag!='fubaodai_whitelist' and systemchannelflag not like '%transform%'
+                  and  emptypename in ('派遣工','實習工','见习生','見習生','实习工','厂商派驻') and jobstname  in ('在職','在职') then '派遣工'
+                       when  customertype='02' and (emptypename is null or  jobstname  in ('离职','離職')) and systemchannelflag not like '%transform%' then '社会人士'
+                       when  (customertype='01' and emptypename in ('正式工') and jobstname  in ('在職','在职')  and  systemchannelflag!='fubaodai_whitelist') OR
+                  (customertype='02' and emptypename in ('正式工') and jobstname  in ('在職','在职')  and  systemchannelflag!='fubaodai_whitelist') then '内部员工' end as 客户类型
+  from (   select a.*,b.JOBSTNAME,b.emptype,b.emptypename
+           from (select a.customerid,a.serialno,a.occurdate,a.systemchannelflag,b.customertype
+                 from business_apply as a
+                   left join ind_info b on a.customerid=b.customerid and REPLACE(a.occurdate,'/','')=b.pt
+                 where a.pt=to_char( dateadd(getdate(),-1,'dd'),'yyyymmdd')
+                 and  a.approvestatus in ('03','05','10','20') --筛选03通过件、10重评、05-人工终止、20注销终止
+                 and a.businesstype='6'--富宝袋
+           ) as a  left join employee_info as b on a.customerid=b.customerid and REPLACE(a.occurdate,'/','')=b.pt
+  ) as a;
+--样本筛选，定义观察期、表现期，以及剔除观察期、表现期不满足样本要求条件
+--定义观察期、表现期
+DROP TABLE  IF EXISTS PQG_B_MODEL_V_1_0_SAMPLE_TIME_WR;
+CREATE TABLE PQG_B_MODEL_V_1_0_SAMPLE_TIME_WR AS
+  SELECT A.CUSTOMERID,
+         MIN(CAST(concat(REPLACE(putoutdate,'/','-')," 00:00:00") AS DATETIME)) AS MIN_放款日,
+         dateadd(MIN(CAST(concat(REPLACE(putoutdate,'/','-')," 00:00:00") AS DATETIME)), 6, 'mm') AS 观察点_观察期截止日,
+         dateadd(MIN(CAST(concat(REPLACE(putoutdate,'/','-')," 00:00:00") AS DATETIME)), 12, 'mm') AS 表现期截止日
+  from FBD_CUSTOMER_TYPE_20200629_WR  a
+    LEFT JOIN (select serialno,contractserialno,businesstype,customerid,putoutdate
+               from acct_loan
+               where businesstype in ('3','4','5')--3--富寶袋支付、5--富寶袋提現、4--富寶袋即時分期
+               and pt=to_char( dateadd(getdate(),-1,'dd'),'yyyymmdd')) b on a.customerid=b.customerid
+  WHERE A.客户类型='社会人士'
+  GROUP BY  A.CUSTOMERID;
+
+
+--未满足表现期时长的客户
+DROP TABLE  IF EXISTS PQG_B_MODEL_V_1_0_insufft_Performance_WR;
+CREATE TABLE PQG_B_MODEL_V_1_0_insufft_Performance_WR AS
+  SELECT *
+  FROM PQG_B_MODEL_V_1_0_SAMPLE_TIME_WR
+  WHERE 表现期截止日>getdate();
+
+
+
+--观察点为逾期的用户
+DROP TABLE  IF EXISTS PQG_B_MODEL_V_1_0_OBStime_OVERDUE_WR;
+CREATE TABLE PQG_B_MODEL_V_1_0_OBStime_OVERDUE_WR AS
+  SELECT A.CUSTOMERID
+  FROM PQG_B_MODEL_V_1_0_SAMPLE_TIME_WR A
+    LEFT JOIN ACCT_LOAN B ON A.CUSTOMERID=B.CUSTOMERID AND A.观察点_观察期截止日=TO_DATE(B.PT,'yyyymmdd')
+  WHERE B.LOANSTATUS='1';
+
+
+
+--表现期内有还款表现的用户
+DROP TABLE IF EXISTS PQG_B_MODEL_V_1_0_Has_performance_WR;
+CREATE TABLE PQG_B_MODEL_V_1_0_Has_performance_WR AS
+  SELECT distinct A.CUSTOMERID
+  FROM (
+    SELECT A.CUSTOMERID,A.观察点_观察期截止日,A.表现期截止日,B.serialno AS AL_SERIALNO
+    FROM PQG_B_MODEL_V_1_0_SAMPLE_TIME_WR A
+      LEFT JOIN (select serialno,contractserialno,businesstype,customerid
+                 from acct_loan
+                 where businesstype in ('3','4','5')--3--富寶袋支付、5--富寶袋提現、4--富寶袋即時分期
+                 and pt=to_char( dateadd(getdate(),-1,'dd'),'yyyymmdd')) b on a.customerid=b.customerid
+  ) A
+    LEFT JOIN  acct_payment_schedule B on A.AL_SERIALNO = B.objectno
+  where B.pstype='1'
+  and B.pt=to_char( dateadd(getdate(),-1,'dd'),'yyyymmdd')
+  and   B.ObjectType = 'jbo.acct.ACCT_LOAN'
+  AND CAST(concat(REPLACE(B.PAYDATE,'/','-')," 00:00:00") AS DATETIME)> A.观察点_观察期截止日
+  AND CAST(concat(REPLACE(B.PAYDATE,'/','-')," 00:00:00") AS DATETIME)< A.表现期截止日;
+
+--最终样本
+DROP TABLE  IF EXISTS PQG_B_MODEL_V_1_0_SAMPLE_DATA_WPS;
+CREATE TABLE PQG_B_MODEL_V_1_0_SAMPLE_DATA_WR AS
+  SELECT *
+  FROM (
+    SELECT *
+    FROM PQG_B_MODEL_V_1_0_SAMPLE_TIME_WR
+    WHERE CUSTOMERID NOT IN (SELECT customerid FROM PQG_B_MODEL_V_1_0_insufft_Performance_WR )--未满足表现期时长的客户
+    AND  CUSTOMERID NOT IN (SELECT customerid FROM PQG_B_MODEL_V_1_0_OBStime_OVERDUE_WR )--观察点为逾期的用户
+  ) T
+  WHERE CUSTOMERID IN (SELECT customerid FROM PQG_B_MODEL_V_1_0_Has_performance_WR );--表现期内有还款表现的用户;
+
+
+
+-------Y标签数据，以及X特征的acct_loan数据
+--ALTER TABLE PQG_B_MODEL_V_1_0_FEAT_DATA RENAME TO PQG_B_MODEL_V_1_0_FEAT_DATA_WPS;
+DROP TABLE  IF EXISTS PQG_B_MODEL_V_1_0_MACH_FEAT_DATA_WR;
+CREATE TABLE PQG_B_MODEL_V_1_0_MACH_FEAT_DATA_WR AS
+  SELECT A.*,
+         B.applyserialno AS 申请流水号,
+         B.applydate AS 申请日期,
+         B.serialno  AS 贷款账号,
+         B.contractserialno  AS 关联合同号,
+         B.al_businesstype  AS 业务品种,
+         B.term AS 期数,
+         B.al_businesssum AS 放款本金,
+         B.outstanding AS 剩余本金余额,
+         B.overdueprincipal AS 逾期本金,
+         CAST(concat(REPLACE(B.minpspaydate,'/','-')," 00:00:00") AS DATETIME) AS 第一期应还日期,
+         B.al_businesssum  AS 贷款金额,
+         CAST(concat(REPLACE(B.al_putoutdate,'/','-')," 00:00:00") AS DATETIME)  AS 贷款发放日期,
+         B.b_occurmonth AS 交易年月,
+         CAST(concat(REPLACE(B.maxpspaydate,'/','-')," 00:00:00") AS DATETIME)  AS 贷款到期日,
+         B.al_loanstatus_cl_itemname AS 贷款状态,
+         CAST(concat(REPLACE(B.maxpsfinishdatedate,'/','-')," 00:00:00") AS DATETIME)   AS 最近一期结清日期,
+         B.al_overduedays  AS 逾期天数,
+         B.al_payaccountno  AS 还款账号,
+         B.al_overduelevel  AS 逾期等级,
+         B.al_overduelevel_simple AS 简化后逾期阶段,
+         B.al_prepayment AS 是否提前还款,
+         B.a_serialno AS 批扣流水号,
+         B.a_channelsource AS 扣款渠道,
+         B.a_dataflagname  AS 是否扣款成功,
+         B.a_amount_revised  AS 扣款金额,
+         B.a_rteinfo_a_remark  AS 扣款状态,
+         B.finishterms  AS 已还期数,
+         B.returnterms  AS 剩余期数,
+         B.interestr  AS 剩余利息余额,
+         B.principalmonthar  AS 应收当月本金,
+         B.principalmonthr  AS 应收当月本金余额,
+         TO_DATE(B.PT,'yyyymmdd') AS PT_DATE,
+         datediff(A.观察点_观察期截止日,TO_DATE(B.PT,'yyyymmdd'), 'dd') AS  观察点_DIFF_PTDATE_DAYS,
+         CASE WHEN datediff(A.观察点_观察期截止日,TO_DATE(B.PT,'yyyymmdd'), 'dd')<=180 AND A.观察点_观察期截止日>TO_DATE(B.PT,'yyyymmdd') THEN 1 ELSE 0 END AS 观察期_FLAG,
+         datediff(A.表现期截止日,TO_DATE(B.PT,'yyyymmdd'), 'dd') AS  表现期截止日_DIFF_PTDATE_DAYS,
+         CASE WHEN datediff(A.表现期截止日,TO_DATE(B.PT,'yyyymmdd'), 'dd')<=180 AND TO_DATE(B.PT,'yyyymmdd')>A.观察点_观察期截止日 THEN 1 ELSE 0 END AS 表现期_FLAG
+  FROM PQG_B_MODEL_V_1_0_SAMPLE_DATA_WR A
+    LEFT JOIN daily_daihou_report_yenpo B ON A.CUSTOMERID=B.al_customerid
+  WHERE al_businesstype in ('账单分期','即时分期','提现')--3--富寶袋支付、4--富寶袋即時分期、5--富寶袋提現
+  AND TO_DATE(B.PT,'yyyymmdd') <= A.表现期截止日;   --筛选取观察期内数据用以衍生X特征，以及Y;
+
+
+--关联初始授信额度
+DROP TABLE  IF EXISTS PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR;
+CREATE TABLE PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR AS
+  SELECT A.*,B.MIN_OCCURDATE,B.MIN_SERIALNO,B.BUSINESSSUM AS 初始授信额度
+  FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA_WR A
+    LEFT JOIN (
+      SELECT A.*,B.BUSINESSSUM
+      FROM (
+        SELECT  A.CUSTOMERID,MIN(B.SERIALNO) AS MIN_SERIALNO,MIN(B.OCCURDATE) AS MIN_OCCURDATE
+        FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA_WR A LEFT JOIN BUSINESS_APPLY B ON A.CUSTOMERID=B.CUSTOMERID
+        WHERE A.观察期_FLAG=1
+        AND B.pt=to_char( dateadd(getdate(),-1,'dd'),'yyyymmdd')
+        and  B.approvestatus in ('03','05','10','20') --筛选03通过件、10重评、05-人工终止、20注销终止
+        and B.businesstype='6'--富宝袋
+        GROUP BY  A.CUSTOMERID
+      ) A LEFT JOIN BUSINESS_APPLY B ON A.MIN_SERIALNO=B.SERIALNO AND B.pt=to_char( dateadd(getdate(),-1,'dd'),'yyyymmdd')
+    ) B ON A.CUSTOMERID=B.CUSTOMERID;
+
+
+--Y标签提取
+--好客户：表现期内，各借据的最大逾期天数<30天
+--坏客户：表现期内，各借据的最大逾期天数>=30天
+DROP TABLE  IF EXISTS PQG_B_MODEL_V_1_0_SAMPLE_Y_WR;
+CREATE TABLE PQG_B_MODEL_V_1_0_SAMPLE_Y_WR AS
+  SELECT CUSTOMERID,
+         case when max(逾期天数) >=30 then 1  when max(逾期天数) <30 OR MAX(逾期天数) IS NULL then 0 else -1 end as y
+  FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR
+  WHERE 表现期_flag=1
+  group by CUSTOMERID;
+
+
+-----------------------------------------------------特征提取----------------------------
+DROP TABLE  IF EXISTS PQG_B_MODEL_V_1_0_FEAT1_WR;
+CREATE TABLE PQG_B_MODEL_V_1_0_FEAT1_WR AS
+  SELECT CUSTOMERID,
+  ------------------------------客户逾期数据
+  --观察期内发生借据合同的月份数
+         count(DISTINCT (CASE WHEN 贷款发放日期>=MIN_放款日 THEN SUBSTR(months_between(观察点_观察期截止日,贷款发放日期),1,1) END)) AS 观察期内放款月份数,
+  --按借据
+         COUNT(DISTINCT(CASE WHEN 逾期天数>0 THEN 关联合同号 END)) AS due_sum_cnt,
+         COUNT(DISTINCT(CASE WHEN 逾期天数>3 THEN 关联合同号 END)) AS due_3_sum_cnt,
+         COUNT(DISTINCT(CASE WHEN 逾期天数>7 THEN 关联合同号 END)) AS due_7_sum_cnt,
+         COUNT(DISTINCT(CASE WHEN 逾期天数>30 THEN 关联合同号 END)) AS due_30_sum_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=30 AND 逾期天数>0  THEN 关联合同号 END)) AS D30_due_sum_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>3  THEN 关联合同号 END)) AS D30_due_3_sum_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>7  THEN 关联合同号 END)) AS D30_due_7_sum_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>0  THEN 关联合同号 END)) AS D60_due_sum_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>3  THEN 关联合同号 END)) AS D60_due_3_sum_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>7  THEN 关联合同号 END)) AS D60_due_7_sum_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>30  THEN 关联合同号 END)) AS D60_due_30_sum_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>0  THEN 关联合同号 END)) AS D90_due_sum_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>3  THEN 关联合同号 END)) AS D90_due_3_sum_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>7  THEN 关联合同号 END)) AS D90_due_7_sum_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>30  THEN 关联合同号 END)) AS D90_due_30_sum_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>0  THEN 关联合同号 END)) AS D120_due_sum_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>3  THEN 关联合同号 END)) AS D120_due_3_sum_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>7  THEN 关联合同号 END)) AS D120_due_7_sum_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>30  THEN 关联合同号 END)) AS D120_due_30_sum_cnt,
+         MAX(CASE WHEN 逾期天数>0 THEN 贷款金额 END) AS due_max_total_AMT,
+         MAX(CASE WHEN 逾期天数>3 THEN 贷款金额 END) AS due_3_max_total_AMT,
+         MAX(CASE WHEN 逾期天数>7 THEN 贷款金额 END) AS due_7_max_total_AMT,
+         MAX(CASE WHEN 逾期天数>30 THEN 贷款金额 END) AS due_30_max_total_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=30 AND 逾期天数>0  THEN 贷款金额 END) AS D30_due_max_total_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>3  THEN 贷款金额 END) AS D30_due_3_max_total_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>7  THEN 贷款金额 END) AS D30_due_7_max_total_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>0  THEN 贷款金额 END) AS D60_due_max_total_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>3  THEN 贷款金额 END) AS D60_due_3_max_total_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>7  THEN 贷款金额 END) AS D60_due_7_max_total_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>30  THEN 贷款金额 END) AS D60_due_30_max_total_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>0  THEN 贷款金额 END) AS D90_due_max_total_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>3  THEN 贷款金额 END) AS D90_due_3_max_total_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>7  THEN 贷款金额 END) AS D90_due_7_max_total_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>30  THEN 贷款金额 END) AS D90_due_30_max_total_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>0  THEN 贷款金额 END) AS D120_due_max_total_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>3  THEN 贷款金额 END) AS D120_due_3_max_total_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>7  THEN 贷款金额 END) AS D120_due_7_max_total_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>30  THEN 贷款金额 END) AS D120_due_30_max_total_AMT,
+         min(CASE WHEN 逾期天数>0 THEN 贷款金额 END) AS due_min_total_AMT,
+         min(CASE WHEN 逾期天数>3 THEN 贷款金额 END) AS due_3_min_total_AMT,
+         min(CASE WHEN 逾期天数>7 THEN 贷款金额 END) AS due_7_min_total_AMT,
+         min(CASE WHEN 逾期天数>30 THEN 贷款金额 END) AS due_30_min_total_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=30 AND 逾期天数>0  THEN 贷款金额 END) AS D30_due_min_total_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>3  THEN 贷款金额 END) AS D30_due_3_min_total_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>7  THEN 贷款金额 END) AS D30_due_7_min_total_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>0  THEN 贷款金额 END) AS D60_due_min_total_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>3  THEN 贷款金额 END) AS D60_due_3_min_total_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>7  THEN 贷款金额 END) AS D60_due_7_min_total_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>30  THEN 贷款金额 END) AS D60_due_30_min_total_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>0  THEN 贷款金额 END) AS D90_due_min_total_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>3  THEN 贷款金额 END) AS D90_due_3_min_total_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>7  THEN 贷款金额 END) AS D90_due_7_min_total_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>30  THEN 贷款金额 END) AS D90_due_30_min_total_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>0  THEN 贷款金额 END) AS D120_due_min_total_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>3  THEN 贷款金额 END) AS D120_due_3_min_total_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>7  THEN 贷款金额 END) AS D120_due_7_min_total_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>30  THEN 贷款金额 END) AS D120_due_30_min_total_AMT,
+  --按提现
+         COUNT(DISTINCT(CASE WHEN 逾期天数>0 AND 业务品种='提现'  THEN 关联合同号 END)) AS due_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 逾期天数>3 AND 业务品种='提现'  THEN 关联合同号 END)) AS due_3_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 逾期天数>7 AND 业务品种='提现'  THEN 关联合同号 END)) AS due_7_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 逾期天数>30 AND 业务品种='提现'  THEN 关联合同号 END)) AS due_30_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=30 AND 逾期天数>0  AND 业务品种='提现'  THEN 关联合同号 END)) AS D30_due_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>3  AND 业务品种='提现'  THEN 关联合同号 END)) AS D30_due_3_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>7  AND 业务品种='提现'  THEN 关联合同号 END)) AS D30_due_7_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>0  AND 业务品种='提现'  THEN 关联合同号 END)) AS D60_due_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>3  AND 业务品种='提现'  THEN 关联合同号 END)) AS D60_due_3_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>7  AND 业务品种='提现'  THEN 关联合同号 END)) AS D60_due_7_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>30  AND 业务品种='提现'  THEN 关联合同号 END)) AS D60_due_30_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>0  AND 业务品种='提现'  THEN 关联合同号 END)) AS D90_due_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>3  AND 业务品种='提现'  THEN 关联合同号 END)) AS D90_due_3_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>7  AND 业务品种='提现'  THEN 关联合同号 END)) AS D90_due_7_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>30  AND 业务品种='提现'  THEN 关联合同号 END)) AS D90_due_30_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>0  AND 业务品种='提现'  THEN 关联合同号 END)) AS D120_due_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>3  AND 业务品种='提现'  THEN 关联合同号 END)) AS D120_due_3_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>7  AND 业务品种='提现'  THEN 关联合同号 END)) AS D120_due_7_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>30  AND 业务品种='提现'  THEN 关联合同号 END)) AS D120_due_30_sum_Wd_cnt,
+         MAX(CASE WHEN 逾期天数>0 AND 业务品种='提现'  THEN 贷款金额 END) AS due_max_Wd_Tal_AMT,
+         MAX(CASE WHEN 逾期天数>3 AND 业务品种='提现'  THEN 贷款金额 END) AS due_3_max_Wd_Tal_AMT,
+         MAX(CASE WHEN 逾期天数>7 AND 业务品种='提现'  THEN 贷款金额 END) AS due_7_max_Wd_Tal_AMT,
+         MAX(CASE WHEN 逾期天数>30 AND 业务品种='提现'  THEN 贷款金额 END) AS due_30_max_Wd_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=30 AND 逾期天数>0  AND 业务品种='提现'  THEN 贷款金额 END) AS D30_due_max_Wd_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>3  AND 业务品种='提现'  THEN 贷款金额 END) AS D30_due_3_max_Wd_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>7  AND 业务品种='提现'  THEN 贷款金额 END) AS D30_due_7_max_Wd_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>0  AND 业务品种='提现'  THEN 贷款金额 END) AS D60_due_max_Wd_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>3  AND 业务品种='提现'  THEN 贷款金额 END) AS D60_due_3_max_Wd_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>7  AND 业务品种='提现'  THEN 贷款金额 END) AS D60_due_7_max_Wd_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>30  AND 业务品种='提现'  THEN 贷款金额 END) AS D60_due_30_max_Wd_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>0  AND 业务品种='提现'  THEN 贷款金额 END) AS D90_due_max_Wd_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>3  AND 业务品种='提现'  THEN 贷款金额 END) AS D90_due_3_max_Wd_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>7  AND 业务品种='提现'  THEN 贷款金额 END) AS D90_due_7_max_Wd_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>30  AND 业务品种='提现'  THEN 贷款金额 END) AS D90_due_30_max_Wd_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>0  AND 业务品种='提现'  THEN 贷款金额 END) AS D120_due_max_Wd_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>3  AND 业务品种='提现'  THEN 贷款金额 END) AS D120_due_3_max_Wd_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>7  AND 业务品种='提现'  THEN 贷款金额 END) AS D120_due_7_max_Wd_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>30  AND 业务品种='提现'  THEN 贷款金额 END) AS D120_due_30_max_Wd_Tal_AMT,
+         min(CASE WHEN 逾期天数>0 AND 业务品种='提现'  THEN 贷款金额 END) AS due_min_Wd_Tal_AMT,
+         min(CASE WHEN 逾期天数>3 AND 业务品种='提现'  THEN 贷款金额 END) AS due_3_min_Wd_Tal_AMT,
+         min(CASE WHEN 逾期天数>7 AND 业务品种='提现'  THEN 贷款金额 END) AS due_7_min_Wd_Tal_AMT,
+         min(CASE WHEN 逾期天数>30 AND 业务品种='提现'  THEN 贷款金额 END) AS due_30_min_Wd_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=30 AND 逾期天数>0  AND 业务品种='提现'  THEN 贷款金额 END) AS D30_due_min_Wd_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>3  AND 业务品种='提现'  THEN 贷款金额 END) AS D30_due_3_min_Wd_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>7  AND 业务品种='提现'  THEN 贷款金额 END) AS D30_due_7_min_Wd_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>0  AND 业务品种='提现'  THEN 贷款金额 END) AS D60_due_min_Wd_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>3  AND 业务品种='提现'  THEN 贷款金额 END) AS D60_due_3_min_Wd_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>7  AND 业务品种='提现'  THEN 贷款金额 END) AS D60_due_7_min_Wd_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>30  AND 业务品种='提现'  THEN 贷款金额 END) AS D60_due_30_min_Wd_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>0  AND 业务品种='提现'  THEN 贷款金额 END) AS D90_due_min_Wd_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>3  AND 业务品种='提现'  THEN 贷款金额 END) AS D90_due_3_min_Wd_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>7  AND 业务品种='提现'  THEN 贷款金额 END) AS D90_due_7_min_Wd_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>30  AND 业务品种='提现'  THEN 贷款金额 END) AS D90_due_30_min_Wd_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>0  AND 业务品种='提现'  THEN 贷款金额 END) AS D120_due_min_Wd_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>3  AND 业务品种='提现'  THEN 贷款金额 END) AS D120_due_3_min_Wd_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>7  AND 业务品种='提现'  THEN 贷款金额 END) AS D120_due_7_min_Wd_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>30  AND 业务品种='提现'  THEN 贷款金额 END) AS D120_due_30_min_Wd_Tal_AMT,
+  --按支付
+         COUNT(DISTINCT(CASE WHEN 逾期天数>0 AND 业务品种='账单分期'  THEN 关联合同号 END)) AS due_sum_pay_cnt,
+         COUNT(DISTINCT(CASE WHEN 逾期天数>3 AND 业务品种='账单分期'  THEN 关联合同号 END)) AS due_3_sum_pay_cnt,
+         COUNT(DISTINCT(CASE WHEN 逾期天数>7 AND 业务品种='账单分期'  THEN 关联合同号 END)) AS due_7_sum_pay_cnt,
+         COUNT(DISTINCT(CASE WHEN 逾期天数>30 AND 业务品种='账单分期'  THEN 关联合同号 END)) AS due_30_sum_pay_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=30 AND 逾期天数>0  AND 业务品种='账单分期'  THEN 关联合同号 END)) AS D30_due_sum_pay_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>3  AND 业务品种='账单分期'  THEN 关联合同号 END)) AS D30_due_3_sum_pay_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>7  AND 业务品种='账单分期'  THEN 关联合同号 END)) AS D30_due_7_sum_pay_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>0  AND 业务品种='账单分期'  THEN 关联合同号 END)) AS D60_due_sum_pay_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>3  AND 业务品种='账单分期'  THEN 关联合同号 END)) AS D60_due_3_sum_pay_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>7  AND 业务品种='账单分期'  THEN 关联合同号 END)) AS D60_due_7_sum_pay_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>30  AND 业务品种='账单分期'  THEN 关联合同号 END)) AS D60_due_30_sum_pay_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>0  AND 业务品种='账单分期'  THEN 关联合同号 END)) AS D90_due_sum_pay_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>3  AND 业务品种='账单分期'  THEN 关联合同号 END)) AS D90_due_3_sum_pay_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>7  AND 业务品种='账单分期'  THEN 关联合同号 END)) AS D90_due_7_sum_pay_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>30  AND 业务品种='账单分期'  THEN 关联合同号 END)) AS D90_due_30_sum_pay_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>0  AND 业务品种='账单分期'  THEN 关联合同号 END)) AS D120_due_sum_pay_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>3  AND 业务品种='账单分期'  THEN 关联合同号 END)) AS D120_due_3_sum_pay_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>7  AND 业务品种='账单分期'  THEN 关联合同号 END)) AS D120_due_7_sum_pay_cnt,
+         COUNT(DISTINCT(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>30  AND 业务品种='账单分期'  THEN 关联合同号 END)) AS D120_due_30_sum_pay_cnt,
+         MAX(CASE WHEN 逾期天数>0 AND 业务品种='账单分期'  THEN 贷款金额 END) AS due_max_pay_Tal_AMT,
+         MAX(CASE WHEN 逾期天数>3 AND 业务品种='账单分期'  THEN 贷款金额 END) AS due_3_max_pay_Tal_AMT,
+         MAX(CASE WHEN 逾期天数>7 AND 业务品种='账单分期'  THEN 贷款金额 END) AS due_7_max_pay_Tal_AMT,
+         MAX(CASE WHEN 逾期天数>30 AND 业务品种='账单分期'  THEN 贷款金额 END) AS due_30_max_pay_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=30 AND 逾期天数>0  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D30_due_max_pay_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>3  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D30_due_3_max_pay_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>7  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D30_due_7_max_pay_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>0  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D60_due_max_pay_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>3  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D60_due_3_max_pay_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>7  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D60_due_7_max_pay_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>30  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D60_due_30_max_pay_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>0  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D90_due_max_pay_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>3  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D90_due_3_max_pay_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>7  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D90_due_7_max_pay_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>30  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D90_due_30_max_pay_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>0  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D120_due_max_pay_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>3  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D120_due_3_max_pay_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>7  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D120_due_7_max_pay_Tal_AMT,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>30  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D120_due_30_max_pay_Tal_AMT,
+         min(CASE WHEN 逾期天数>0 AND 业务品种='账单分期'  THEN 贷款金额 END) AS due_min_pay_Tal_AMT,
+         min(CASE WHEN 逾期天数>3 AND 业务品种='账单分期'  THEN 贷款金额 END) AS due_3_min_pay_Tal_AMT,
+         min(CASE WHEN 逾期天数>7 AND 业务品种='账单分期'  THEN 贷款金额 END) AS due_7_min_pay_Tal_AMT,
+         min(CASE WHEN 逾期天数>30 AND 业务品种='账单分期'  THEN 贷款金额 END) AS due_30_min_pay_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=30 AND 逾期天数>0  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D30_due_min_pay_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>3  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D30_due_3_min_pay_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>7  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D30_due_7_min_pay_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>0  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D60_due_min_pay_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>3  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D60_due_3_min_pay_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>7  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D60_due_7_min_pay_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>30  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D60_due_30_min_pay_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>0  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D90_due_min_pay_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>3  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D90_due_3_min_pay_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>7  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D90_due_7_min_pay_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>30  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D90_due_30_min_pay_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>0  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D120_due_min_pay_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>3  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D120_due_3_min_pay_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>7  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D120_due_7_min_pay_Tal_AMT,
+         min(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>30  AND 业务品种='账单分期'  THEN 贷款金额 END) AS D120_due_30_min_pay_Tal_AMT,
+  --最大逾期天数
+         MAX(逾期天数) AS max_due_days,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=30 THEN  逾期天数 END) AS D30_max_due_days,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=60 THEN  逾期天数 END) AS D60_max_due_days,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=90 THEN  逾期天数 END) AS D90_max_due_days,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=120 THEN  逾期天数 END) AS D120_max_due_days,
+  --已还期数
+         MAX(CASE WHEN 逾期天数>0 THEN 已还期数 END) AS due_max_Repaid_Perd,
+         MAX(CASE WHEN 逾期天数>3 THEN 已还期数 END) AS due_3_max_Repaid_Perd,
+         MAX(CASE WHEN 逾期天数>7 THEN 已还期数 END) AS due_7_max_Repaid_Perd,
+         MAX(CASE WHEN 逾期天数>30 THEN 已还期数 END) AS due_30_max_Repaid_Perd,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=30 AND 逾期天数>0  THEN 已还期数 END) AS D30_due_max_Repaid_Perd,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>3  THEN 已还期数 END) AS D30_due_3_max_Repaid_Perd,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>7  THEN 已还期数 END) AS D30_due_7_max_Repaid_Perd,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>0  THEN 已还期数 END) AS D60_due_max_Repaid_Perd,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>3  THEN 已还期数 END) AS D60_due_3_max_Repaid_Perd,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>7  THEN 已还期数 END) AS D60_due_7_max_Repaid_Perd,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>30  THEN 已还期数 END) AS D60_due_30_max_Repaid_Perd,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>0  THEN 已还期数 END) AS D90_due_max_Repaid_Perd,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>3  THEN 已还期数 END) AS D90_due_3_max_Repaid_Perd,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>7  THEN 已还期数 END) AS D90_due_7_max_Repaid_Perd,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>30  THEN 已还期数 END) AS D90_due_30_max_Repaid_Perd,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>0  THEN 已还期数 END) AS D120_due_max_Repaid_Perd,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>3  THEN 已还期数 END) AS D120_due_3_max_Repaid_Perd,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>7  THEN 已还期数 END) AS D120_due_7_max_Repaid_Perd,
+         MAX(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>30  THEN 已还期数 END) AS D120_due_30_max_Repaid_Perd,
+
+         MIN(CASE WHEN 逾期天数>0 THEN 已还期数 END) AS due_MIN_Repaid_Perd,
+         MIN(CASE WHEN 逾期天数>3 THEN 已还期数 END) AS due_3_MIN_Repaid_Perd,
+         MIN(CASE WHEN 逾期天数>7 THEN 已还期数 END) AS due_7_MIN_Repaid_Perd,
+         MIN(CASE WHEN 逾期天数>30 THEN 已还期数 END) AS due_30_MIN_Repaid_Perd,
+         MIN(CASE WHEN 观察点_diff_ptdate_days<=30 AND 逾期天数>0  THEN 已还期数 END) AS D30_due_MIN_Repaid_Perd,
+         MIN(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>3  THEN 已还期数 END) AS D30_due_3_MIN_Repaid_Perd,
+         MIN(CASE WHEN 观察点_diff_ptdate_days<=30 AND  逾期天数>7  THEN 已还期数 END) AS D30_due_7_MIN_Repaid_Perd,
+         MIN(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>0  THEN 已还期数 END) AS D60_due_MIN_Repaid_Perd,
+         MIN(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>3  THEN 已还期数 END) AS D60_due_3_MIN_Repaid_Perd,
+         MIN(CASE WHEN 观察点_diff_ptdate_days<=60 AND  逾期天数>7  THEN 已还期数 END) AS D60_due_7_MIN_Repaid_Perd,
+         MIN(CASE WHEN 观察点_diff_ptdate_days<=60 AND 逾期天数>30  THEN 已还期数 END) AS D60_due_30_MIN_Repaid_Perd,
+         MIN(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>0  THEN 已还期数 END) AS D90_due_MIN_Repaid_Perd,
+         MIN(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>3  THEN 已还期数 END) AS D90_due_3_MIN_Repaid_Perd,
+         MIN(CASE WHEN 观察点_diff_ptdate_days<=90 AND  逾期天数>7  THEN 已还期数 END) AS D90_due_7_MIN_Repaid_Perd,
+         MIN(CASE WHEN 观察点_diff_ptdate_days<=90 AND 逾期天数>30  THEN 已还期数 END) AS D90_due_30_MIN_Repaid_Perd,
+         MIN(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>0  THEN 已还期数 END) AS D120_due_MIN_Repaid_Perd,
+         MIN(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>3  THEN 已还期数 END) AS D120_due_3_MIN_Repaid_Perd,
+         MIN(CASE WHEN 观察点_diff_ptdate_days<=120 AND  逾期天数>7  THEN 已还期数 END) AS D120_due_7_MIN_Repaid_Perd,
+         MIN(CASE WHEN 观察点_diff_ptdate_days<=120 AND 逾期天数>30  THEN 已还期数 END) AS D120_due_30_MIN_Repaid_Perd,
+
+  --------------------------------------客户结清数据
+         COUNT(DISTINCT(CASE WHEN 贷款状态='正常'  THEN 关联合同号 END)) AS normal_cnt,
+         COUNT(DISTINCT(CASE WHEN 贷款状态='正常结清'  THEN 关联合同号 END)) AS normal_settle_cnt,
+         COUNT(DISTINCT(CASE WHEN 贷款状态='正常结清'  AND 观察点_diff_ptdate_days<=30  THEN 关联合同号 END)) AS D30_normal_settle_cnt,
+         COUNT(DISTINCT(CASE WHEN 贷款状态='正常结清'  AND 观察点_diff_ptdate_days<=60  THEN 关联合同号 END)) AS D60_normal_settle_cnt,
+         COUNT(DISTINCT(CASE WHEN 贷款状态='正常结清'  AND 观察点_diff_ptdate_days<=90  THEN 关联合同号 END)) AS D90_normal_settle_cnt,
+         COUNT(DISTINCT(CASE WHEN 贷款状态='正常结清'  AND 观察点_diff_ptdate_days<=120  THEN 关联合同号 END)) AS D120_normal_settle_cnt,
+         COUNT(DISTINCT(CASE WHEN 贷款状态='提前结清'  THEN 关联合同号 END)) AS settle_in_advance_cnt,
+         COUNT(DISTINCT(CASE WHEN 贷款状态='提前结清'  AND 观察点_diff_ptdate_days<=30  THEN 关联合同号 END)) AS D30_settle_in_advance_cnt,
+         COUNT(DISTINCT(CASE WHEN 贷款状态='提前结清'  AND 观察点_diff_ptdate_days<=60  THEN 关联合同号 END)) AS D60_settle_in_advance_cnt,
+         COUNT(DISTINCT(CASE WHEN 贷款状态='提前结清'  AND 观察点_diff_ptdate_days<=90  THEN 关联合同号 END)) AS D90_settle_in_advance_cnt,
+         COUNT(DISTINCT(CASE WHEN 贷款状态='提前结清'  AND 观察点_diff_ptdate_days<=120  THEN 关联合同号 END)) AS D120_settle_in_advance_cnt,
+         COUNT(DISTINCT(CASE WHEN 贷款状态='逾期结清'  THEN 关联合同号 END)) AS overdue_settle_cnt,
+         COUNT(DISTINCT(CASE WHEN 贷款状态='逾期结清'  AND 观察点_diff_ptdate_days<=30  THEN 关联合同号 END)) AS D30_overdue_settle_cnt,
+         COUNT(DISTINCT(CASE WHEN 贷款状态='逾期结清'  AND 观察点_diff_ptdate_days<=60  THEN 关联合同号 END)) AS D60_overdue_settle_cnt,
+         COUNT(DISTINCT(CASE WHEN 贷款状态='逾期结清'  AND 观察点_diff_ptdate_days<=90  THEN 关联合同号 END)) AS D90_overdue_settle_cnt,
+         COUNT(DISTINCT(CASE WHEN 贷款状态='逾期结清'  AND 观察点_diff_ptdate_days<=120  THEN 关联合同号 END)) AS D120_overdue_settle_cnt,
+
+  ------------------------------------客户使用数据
+  --
+         COUNT(DISTINCT 关联合同号) AS sum_loan_cnt,
+         COUNT(DISTINCT(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=30  THEN 关联合同号 END)) AS D30_sum_loan_cnt,
+         COUNT(DISTINCT(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=60  THEN 关联合同号 END)) AS D60_sum_loan_cnt,
+         COUNT(DISTINCT(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=90  THEN 关联合同号 END)) AS D90_sum_loan_cnt,
+         COUNT(DISTINCT(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=120  THEN 关联合同号 END)) AS D120_sum_loan_cnt,
+         COUNT(DISTINCT 关联合同号) AS sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 业务品种='提现' AND datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=30  THEN 关联合同号 END)) AS D30_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 业务品种='提现' AND datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=60  THEN 关联合同号 END)) AS D60_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 业务品种='提现' AND datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=90  THEN 关联合同号 END)) AS D90_sum_Wd_cnt,
+         COUNT(DISTINCT(CASE WHEN 业务品种='提现' AND datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=120  THEN 关联合同号 END)) AS D120_sum_Wd_cnt,
+         COUNT(DISTINCT 关联合同号) AS sum_PAY_cnt,
+         COUNT(DISTINCT(CASE WHEN 业务品种='账单分期' AND datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=30  THEN 关联合同号 END)) AS D30_sum_PAY_cnt,
+         COUNT(DISTINCT(CASE WHEN 业务品种='账单分期' AND datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=60  THEN 关联合同号 END)) AS D60_sum_PAY_cnt,
+         COUNT(DISTINCT(CASE WHEN 业务品种='账单分期' AND datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=90  THEN 关联合同号 END)) AS D90_sum_PAY_cnt,
+         COUNT(DISTINCT(CASE WHEN 业务品种='账单分期' AND datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=120  THEN 关联合同号 END)) AS D120_sum_PAY_cnt,
+  --最大单笔金额
+         MAX(贷款金额) AS max_total_AMT,MAX(贷款金额)/初始授信额度  AS max_total_AMTD_CL,
+         MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=30  THEN 贷款金额 END) AS D30_max_total_AMT,MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=30  THEN 贷款金额 END)/初始授信额度  AS D30_max_total_AMTD_CL,
+         MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=60  THEN 贷款金额 END) AS D60_max_total_AMT,MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=60  THEN 贷款金额 END)/初始授信额度  AS D60_max_total_AMTD_CL,
+         MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=90  THEN 贷款金额 END) AS D90_max_total_AMT,MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=90  THEN 贷款金额 END)/初始授信额度  AS D90_max_total_AMTD_CL,
+         MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=120  THEN 贷款金额 END) AS D120_max_total_AMT,MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=120  THEN 贷款金额 END)/初始授信额度  AS D120_max_total_AMTD_CL,
+         MAX(CASE WHEN 业务品种='提现' THEN 贷款金额 END) AS max_Wd_AMT,MAX(CASE WHEN 业务品种='提现' THEN 贷款金额 END)/初始授信额度  AS max_Wd_AMTD_CL,
+         MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=30 AND 业务品种='提现' THEN 贷款金额 END) AS D30_max_Wd_AMT,MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=30 AND 业务品种='提现' THEN 贷款金额 END)/初始授信额度  AS D30_max_Wd_AMTD_CL,
+         MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=60 AND 业务品种='提现'  THEN 贷款金额 END) AS D60_max_Wd_AMT,MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=60 AND 业务品种='提现'  THEN 贷款金额 END)/初始授信额度  AS D60_max_Wd_AMTD_CL,
+         MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=90 AND 业务品种='提现'  THEN 贷款金额 END) AS D90_max_Wd_AMT,MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=90 AND 业务品种='提现'  THEN 贷款金额 END)/初始授信额度  AS D90_max_Wd_AMTD_CL,
+         MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=120 AND 业务品种='提现'  THEN 贷款金额 END) AS D120_max_Wd_AMT,MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=120 AND 业务品种='提现'  THEN 贷款金额 END)/初始授信额度  AS D120_max_Wd_AMTD_CL,
+         MAX(CASE WHEN 业务品种='账单分期' THEN 贷款金额 END) AS max_PAY_AMT,MAX(CASE WHEN 业务品种='账单分期' THEN 贷款金额 END)/初始授信额度  AS max_PAY_AMTD_CL,
+         MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=30 AND 业务品种='账单分期' THEN 贷款金额 END) AS D30_max_PAY_AMT,MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=30 AND 业务品种='账单分期' THEN 贷款金额 END)/初始授信额度  AS D30_max_PAY_AMTD_CL,
+         MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=60 AND 业务品种='账单分期'  THEN 贷款金额 END) AS D60_max_PAY_AMT,MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=60 AND 业务品种='账单分期'  THEN 贷款金额 END)/初始授信额度  AS D60_max_PAY_AMTD_CL,
+         MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=90 AND 业务品种='账单分期'  THEN 贷款金额 END) AS D90_max_PAY_AMT,MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=90 AND 业务品种='账单分期'  THEN 贷款金额 END)/初始授信额度  AS D90_max_PAY_AMTD_CL,
+         MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=120 AND 业务品种='账单分期'  THEN 贷款金额 END) AS D120_max_PAY_AMT,MAX(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=120 AND 业务品种='账单分期'  THEN 贷款金额 END)/初始授信额度  AS D120_max_PAY_AMTD_CL,
+
+  --最小单笔金额
+         MIN(贷款金额) AS MIN_total_AMT,MIN(贷款金额)/初始授信额度  AS MIN_total_AMTD_CL,
+         MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=30  THEN 贷款金额 END) AS D30_MIN_total_AMT,MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=30  THEN 贷款金额 END)/初始授信额度  AS D30_MIN_total_AMTD_CL,
+         MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=60  THEN 贷款金额 END) AS D60_MIN_total_AMT,MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=60  THEN 贷款金额 END)/初始授信额度  AS D60_MIN_total_AMTD_CL,
+         MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=90  THEN 贷款金额 END) AS D90_MIN_total_AMT,MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=90  THEN 贷款金额 END)/初始授信额度  AS D90_MIN_total_AMTD_CL,
+         MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=120  THEN 贷款金额 END) AS D120_MIN_total_AMT,MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=120  THEN 贷款金额 END)/初始授信额度  AS D120_MIN_total_AMTD_CL,
+         MIN(CASE WHEN 业务品种='提现' THEN 贷款金额 END) AS MIN_Wd_AMT,MIN(CASE WHEN 业务品种='提现' THEN 贷款金额 END)/初始授信额度  AS MIN_Wd_AMTD_CL,
+         MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=30 AND 业务品种='提现' THEN 贷款金额 END) AS D30_MIN_Wd_AMT,MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=30 AND 业务品种='提现' THEN 贷款金额 END)/初始授信额度  AS D30_MIN_Wd_AMTD_CL,
+         MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=60 AND 业务品种='提现'  THEN 贷款金额 END) AS D60_MIN_Wd_AMT,MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=60 AND 业务品种='提现'  THEN 贷款金额 END)/初始授信额度  AS D60_MIN_Wd_AMTD_CL,
+         MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=90 AND 业务品种='提现'  THEN 贷款金额 END) AS D90_MIN_Wd_AMT,MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=90 AND 业务品种='提现'  THEN 贷款金额 END)/初始授信额度  AS D90_MIN_Wd_AMTD_CL,
+         MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=120 AND 业务品种='提现'  THEN 贷款金额 END) AS D120_MIN_Wd_AMT,MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=120 AND 业务品种='提现'  THEN 贷款金额 END)/初始授信额度  AS D120_MIN_Wd_AMTD_CL,
+         MIN(CASE WHEN 业务品种='账单分期' THEN 贷款金额 END) AS MIN_PAY_AMT,MIN(CASE WHEN 业务品种='账单分期' THEN 贷款金额 END)/初始授信额度  AS MIN_PAY_AMTD_CL,
+         MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=30 AND 业务品种='账单分期' THEN 贷款金额 END) AS D30_MIN_PAY_AMT,MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=30 AND 业务品种='账单分期' THEN 贷款金额 END)/初始授信额度  AS D30_MIN_PAY_AMTD_CL,
+         MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=60 AND 业务品种='账单分期'  THEN 贷款金额 END) AS D60_MIN_PAY_AMT,MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=60 AND 业务品种='账单分期'  THEN 贷款金额 END)/初始授信额度  AS D60_MIN_PAY_AMTD_CL,
+         MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=90 AND 业务品种='账单分期'  THEN 贷款金额 END) AS D90_MIN_PAY_AMT,MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=90 AND 业务品种='账单分期'  THEN 贷款金额 END)/初始授信额度  AS D90_MIN_PAY_AMTD_CL,
+         MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=120 AND 业务品种='账单分期'  THEN 贷款金额 END) AS D120_MIN_PAY_AMT,MIN(CASE WHEN datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=120 AND 业务品种='账单分期'  THEN 贷款金额 END)/初始授信额度  AS D120_MIN_PAY_AMTD_CL
+  FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR
+  WHERE 观察期_FLAG=1
+  GROUP BY  CUSTOMERID,初始授信额度;
+
+
+--各合同最大逾期天数之和
+DROP TABLE  IF EXISTS PQG_B_MODEL_V_1_0_FEAT2_WR;
+CREATE TABLE PQG_B_MODEL_V_1_0_FEAT2_WR AS
+  SELECT customerid,
+         SUM(C_MAX_DUEDAYS) AS Due_days_sum,
+         SUM(D30_C_MAX_DUEDAYS) AS D30_due_days_sum,
+         SUM(D60_C_MAX_DUEDAYS) AS D60_due_days_sum,
+         SUM(D90_C_MAX_DUEDAYS) AS D90_due_days_sum,
+         SUM(D120_C_MAX_DUEDAYS) AS D120_due_days_sum
+  FROM (
+    SELECT CUSTOMERID,关联合同号,
+           MAX(逾期天数) AS C_MAX_DUEDAYS,
+           MAX(CASE WHEN 观察点_diff_ptdate_days<=30 THEN 逾期天数 END) AS D30_C_MAX_DUEDAYS,
+           MAX(CASE WHEN 观察点_diff_ptdate_days<=60 THEN 逾期天数 END) AS D60_C_MAX_DUEDAYS,
+           MAX(CASE WHEN 观察点_diff_ptdate_days<=90 THEN 逾期天数 END) AS D90_C_MAX_DUEDAYS,
+           MAX(CASE WHEN 观察点_diff_ptdate_days<=120 THEN 逾期天数 END) AS D120_C_MAX_DUEDAYS
+    FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR
+    WHERE 观察期_FLAG=1
+    GROUP BY  CUSTOMERID,关联合同号)A
+  GROUP BY  customerid;
+
+
+--逾期类总放款本金
+DROP TABLE  IF EXISTS PQG_B_MODEL_V_1_0_FEAT3_WR;
+CREATE TABLE PQG_B_MODEL_V_1_0_FEAT3_WR AS
+  SELECT A.CUSTOMERID,
+         SUM( B.放款本金) AS due_sum_total_AMT,SUM( B.放款本金)/初始授信额度 AS due_sum_total_AMT_D_CL,
+         SUM( C.放款本金) AS due_3_sum_total_AMT,SUM( C.放款本金)/初始授信额度 AS due_3_sum_total_AMT_D_CL,
+         SUM( D.放款本金) AS due_7_sum_total_AMT,SUM( D.放款本金)/初始授信额度 AS due_7_sum_total_AMT_D_CL,
+         SUM( E.放款本金) AS due_15_sum_total_AMT,SUM( E.放款本金)/初始授信额度 AS due_15_sum_total_AMT_D_CL,
+         SUM( F.放款本金) AS due_30_sum_total_AMT,SUM(F.放款本金)/初始授信额度 AS due_30_sum_total_AMT_D_CL
+
+  FROM (SELECT DISTINCT CUSTOMERID,关联合同号,放款本金,初始授信额度
+        FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR
+        WHERE 观察期_FLAG=1) A
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE 逾期天数>0 AND  观察期_FLAG=1) B ON A.关联合同号=B.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE 逾期天数>3 AND  观察期_FLAG=1) C ON A.关联合同号=C.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE 逾期天数>7  AND  观察期_FLAG=1) D ON A.关联合同号=D.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE 逾期天数>15  AND  观察期_FLAG=1) E ON A.关联合同号=E.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE 逾期天数>30  AND  观察期_FLAG=1) F ON A.关联合同号=F.关联合同号
+  GROUP BY A.CUSTOMERID,A.初始授信额度;
+
+
+--逾期类总提现本金
+DROP TABLE  IF EXISTS PQG_B_MODEL_V_1_0_FEAT4_WR;
+CREATE TABLE PQG_B_MODEL_V_1_0_FEAT4_WR AS
+  SELECT A.CUSTOMERID,
+         SUM( B.放款本金) AS due_sum_Wd_AMT,SUM( B.放款本金)/初始授信额度 AS due_sum_Wd_AMT_D_CL,
+         SUM( C.放款本金) AS due_3_sum_Wd_AMT,SUM( C.放款本金)/初始授信额度 AS due_3_sum_Wd_AMT_D_CL,
+         SUM( D.放款本金) AS due_7_sum_Wd_AMT,SUM( D.放款本金)/初始授信额度 AS due_7_sum_Wd_AMT_D_CL,
+         SUM( E.放款本金) AS due_15_sum_Wd_AMT,SUM( E.放款本金)/初始授信额度 AS due_15_sum_Wd_AMT_D_CL,
+         SUM( F.放款本金) AS due_30_sum_Wd_AMTSUM,SUM(F.放款本金)/初始授信额度 AS due_30_sum_Wd_AMT_D_CL
+  FROM (SELECT DISTINCT CUSTOMERID,关联合同号,放款本金,初始授信额度
+        FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR
+        WHERE 观察期_FLAG=1) A
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE 逾期天数>0 AND 业务品种='提现' AND  观察期_FLAG=1) B ON A.关联合同号=B.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE 逾期天数>3 AND 业务品种='提现' AND  观察期_FLAG=1) C ON A.关联合同号=C.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE 逾期天数>7  AND 业务品种='提现' AND  观察期_FLAG=1) D ON A.关联合同号=D.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE 逾期天数>15  AND 业务品种='提现' AND  观察期_FLAG=1) E ON A.关联合同号=E.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE 逾期天数>30  AND 业务品种='提现' AND  观察期_FLAG=1) F ON A.关联合同号=F.关联合同号
+  GROUP BY A.CUSTOMERID,A.初始授信额度;
+
+
+--逾期类总支付本金
+DROP TABLE  IF EXISTS PQG_B_MODEL_V_1_0_FEAT5_WR;
+CREATE TABLE PQG_B_MODEL_V_1_0_FEAT5_WR AS
+  SELECT A.CUSTOMERID,
+         SUM( B.放款本金) AS due_sum_PAY_AMT,SUM( B.放款本金)/初始授信额度 AS due_sum_PAY_AMT_D_CL,
+         SUM( C.放款本金) AS due_3_sum_PAY_AMT,SUM( C.放款本金)/初始授信额度 AS due_3_sum_PAY_AMT_D_CL,
+         SUM( D.放款本金) AS due_7_sum_PAY_AMT,SUM( D.放款本金)/初始授信额度 AS due_7_sum_PAY_AMT_D_CL,
+         SUM( E.放款本金) AS due_15_sum_PAY_AMT,SUM( E.放款本金)/初始授信额度 AS due_15_sum_PAY_AMT_D_CL,
+         SUM( F.放款本金) AS due_30_sum_PAY_AMTSUM,SUM(F.放款本金)/初始授信额度 AS due_30_sum_PAY_AMT_D_CL
+  FROM (SELECT DISTINCT CUSTOMERID,关联合同号,放款本金,初始授信额度
+        FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR
+        WHERE 观察期_FLAG=1) A
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE 逾期天数>0 AND 业务品种='账单分期' AND  观察期_FLAG=1) B ON A.关联合同号=B.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE 逾期天数>3 AND 业务品种='账单分期' AND  观察期_FLAG=1) C ON A.关联合同号=C.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE 逾期天数>7  AND 业务品种='账单分期' AND  观察期_FLAG=1) D ON A.关联合同号=D.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE 逾期天数>15  AND 业务品种='账单分期' AND  观察期_FLAG=1) E ON A.关联合同号=E.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE 逾期天数>30  AND 业务品种='账单分期' AND  观察期_FLAG=1) F ON A.关联合同号=F.关联合同号
+  GROUP BY A.CUSTOMERID,A.初始授信额度;
+
+
+--总放款本金
+DROP TABLE  IF EXISTS PQG_B_MODEL_V_1_0_FEAT6_WR;
+CREATE TABLE PQG_B_MODEL_V_1_0_FEAT6_WR AS
+  SELECT A.CUSTOMERID,
+         SUM( B.放款本金) AS sum_total_AMT,SUM( B.放款本金)/初始授信额度 AS sum_total_AMT_D_CL,
+         SUM( C.放款本金) AS D30_sum_total_AMT,SUM( C.放款本金)/初始授信额度 AS D30_sum_total_AMT_D_CL,
+         SUM( D.放款本金) AS D60_sum_total_AMT,SUM( D.放款本金)/初始授信额度 AS D60_sum_total_AMT_D_CL,
+         SUM( E.放款本金) AS D90_sum_total_AMT,SUM( E.放款本金)/初始授信额度 AS D90_sum_total_AMT_D_CL,
+         SUM( F.放款本金) AS D120_sum_total_AMTSUM,SUM(F.放款本金)/初始授信额度 AS D120_sum_total_AMT_D_CL
+
+  FROM (SELECT DISTINCT CUSTOMERID,关联合同号,放款本金,初始授信额度
+        FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR
+        WHERE 观察期_FLAG=1) A
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR ) B ON A.关联合同号=B.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=30  AND  观察期_FLAG=1) C ON A.关联合同号=C.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=60  AND  观察期_FLAG=1) D ON A.关联合同号=D.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=90  AND  观察期_FLAG=1) E ON A.关联合同号=E.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=120  AND  观察期_FLAG=1) F ON A.关联合同号=F.关联合同号
+  GROUP BY A.CUSTOMERID,A.初始授信额度;
+
+
+--总提现本金
+DROP TABLE  IF EXISTS PQG_B_MODEL_V_1_0_FEAT7_WR;
+CREATE TABLE PQG_B_MODEL_V_1_0_FEAT7_WR AS
+  SELECT A.CUSTOMERID,
+         SUM( B.放款本金) AS sum_Wd_AMT,SUM( B.放款本金)/初始授信额度 AS sum_Wd_AMT_D_CL,
+         SUM( C.放款本金) AS D30_sum_Wd_AMT,SUM( C.放款本金)/初始授信额度 AS D30_sum_Wd_AMT_D_CL,
+         SUM( D.放款本金) AS D60_sum_Wd_AMT,SUM( D.放款本金)/初始授信额度 AS D60_sum_Wd_AMT_D_CL,
+         SUM( E.放款本金) AS D90_sum_Wd_AMT,SUM( E.放款本金)/初始授信额度 AS D90_sum_Wd_AMT_D_CL,
+         SUM( F.放款本金) AS D120_sum_Wd_AMTSUM,SUM(F.放款本金)/初始授信额度 AS D120_sum_Wd_AMT_D_CL
+  FROM (SELECT DISTINCT CUSTOMERID,关联合同号,放款本金,初始授信额度
+        FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR
+        WHERE 观察期_FLAG=1) A
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE 业务品种='提现') B ON A.关联合同号=B.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=30 AND 业务品种='提现' AND  观察期_FLAG=1) C ON A.关联合同号=C.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=60  AND 业务品种='提现' AND  观察期_FLAG=1) D ON A.关联合同号=D.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=90  AND 业务品种='提现' AND  观察期_FLAG=1) E ON A.关联合同号=E.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=300  AND 业务品种='提现' AND  观察期_FLAG=1) F ON A.关联合同号=F.关联合同号
+  GROUP BY A.CUSTOMERID,A.初始授信额度;
+
+
+--总支付本金
+DROP TABLE  IF EXISTS PQG_B_MODEL_V_1_0_FEAT8_WR;
+CREATE TABLE PQG_B_MODEL_V_1_0_FEAT8_WR AS
+  SELECT A.CUSTOMERID,
+         SUM( B.放款本金) AS sum_PAY_AMT,SUM( B.放款本金)/初始授信额度 AS sum_PAY_AMT_D_CL,
+         SUM( C.放款本金) AS D30_sum_PAY_AMT,SUM( C.放款本金)/初始授信额度 AS D30_sum_PAY_AMT_D_CL,
+         SUM( D.放款本金) AS D60_sum_PAY_AMT,SUM( D.放款本金)/初始授信额度 AS D60_sum_PAY_AMT_D_CL,
+         SUM( E.放款本金) AS D90_sum_PAY_AMT,SUM( E.放款本金)/初始授信额度 AS D90_sum_PAY_AMT_D_CL,
+         SUM( F.放款本金) AS D120_sum_PAY_AMTSUM,SUM(F.放款本金)/初始授信额度 AS D120_sum_PAY_AMT_D_CL
+  FROM (SELECT DISTINCT CUSTOMERID,关联合同号,放款本金,初始授信额度
+        FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR
+        WHERE 观察期_FLAG=1) A
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE 业务品种='账单分期') B ON A.关联合同号=B.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=30 AND 业务品种='账单分期' AND  观察期_FLAG=1) C ON A.关联合同号=C.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=60  AND 业务品种='账单分期' AND  观察期_FLAG=1) D ON A.关联合同号=D.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=90  AND 业务品种='账单分期' AND  观察期_FLAG=1) E ON A.关联合同号=E.关联合同号
+    left join  (SELECT DISTINCT  关联合同号,放款本金 FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR WHERE datediff(观察点_观察期截止日,贷款发放日期, 'dd')<=120  AND 业务品种='账单分期' AND  观察期_FLAG=1) F ON A.关联合同号=F.关联合同号
+  GROUP BY A.CUSTOMERID,A.初始授信额度;
+
+
+--计算观察期内应还月份数
+DROP TABLE  IF EXISTS PQG_B_MODEL_V_1_0_MACH_FEAT_DATA2_WR;
+CREATE TABLE PQG_B_MODEL_V_1_0_MACH_FEAT_DATA2_WR AS
+  select a.*,CAST(concat(REPLACE(B.paydate ,'/','-')," 00:00:00") AS DATETIME)  AS 应还日期
+  from PQG_B_MODEL_V_1_0_MACH_FEAT_DATA1_WR a left join acct_payment_schedule  b on a.贷款账号=b.objectno
+  where B.pstype='1'
+  and B.pt=to_char( dateadd(getdate(),-1,'dd'),'yyyymmdd')
+  and   B.ObjectType = 'jbo.acct.ACCT_LOAN'
+  AND  A.观察期_FLAG=1;
+
+
+DROP TABLE  IF EXISTS PQG_B_MODEL_V_1_0_FEAT9_WR;
+CREATE TABLE PQG_B_MODEL_V_1_0_FEAT9_WR AS
+  SELECT CUSTOMERID,
+         count(DISTINCT (CASE WHEN 应还日期<=观察点_观察期截止日 THEN substr(应还日期,1,7) END)) AS 观察期内应还月份数
+  FROM PQG_B_MODEL_V_1_0_MACH_FEAT_DATA2_WR
+  WHERE 观察期_FLAG=1
+  group by CUSTOMERID;
+
+
+-------------------------------------特征汇总宽表---------------------------------------
+--合并特征以及Y
+--tunnel download PQG_B_MODEL_V_1_0_ALL_FEAT_WPS C:\Users\Administrator\Desktop\数据\派遣工行为评分卡_V_1_0_特征宽表_WPS.csv -h true;
+DROP TABLE  IF EXISTS PQG_B_MODEL_V_1_0_ALL_FEAT_WR;
+CREATE TABLE PQG_B_MODEL_V_1_0_ALL_FEAT_WR AS
+  SELECT J.Y,A.*
+  ,B.due_days_sum,B.d30_due_days_sum,B.d60_due_days_sum,B.d90_due_days_sum,B.d120_due_days_sum,
+         C.due_sum_total_amt,
+         C.due_sum_total_amt_d_cl,
+         C.due_3_sum_total_amt,
+         C.due_3_sum_total_amt_d_cl,
+         C.due_7_sum_total_amt,
+         C.due_7_sum_total_amt_d_cl,
+         C.due_15_sum_total_amt,
+         C.due_15_sum_total_amt_d_cl,
+         C.due_30_sum_total_amt,
+         D.due_sum_wd_amt,
+         D.due_sum_wd_amt_d_cl,
+         D.due_3_sum_wd_amt,
+         D.due_3_sum_wd_amt_d_cl,
+         D.due_7_sum_wd_amt,
+         D.due_7_sum_wd_amt_d_cl,
+         D.due_15_sum_wd_amt,
+         D.due_15_sum_wd_amt_d_cl,
+         D.due_30_sum_wd_amtsum,
+         D.due_30_sum_wd_amt_d_cl,
+         E.due_sum_pay_amt,
+         E.due_sum_pay_amt_d_cl,
+         E.due_3_sum_pay_amt,
+         E.due_3_sum_pay_amt_d_cl,
+         E.due_7_sum_pay_amt,
+         E.due_7_sum_pay_amt_d_cl,
+         E.due_15_sum_pay_amt,
+         E.due_15_sum_pay_amt_d_cl,
+         E.due_30_sum_pay_amtsum,
+         E.due_30_sum_pay_amt_d_cl,
+         F.sum_total_amt,
+         F.sum_total_amt_d_cl,
+         F.d30_sum_total_amt,
+         F.d30_sum_total_amt_d_cl,
+         F.d60_sum_total_amt,
+         F.d60_sum_total_amt_d_cl,
+         F.d90_sum_total_amt,
+         F.d90_sum_total_amt_d_cl,
+         F.d120_sum_total_amtsum,
+         F.d120_sum_total_amt_d_cl,
+         G.sum_wd_amt,
+         G.sum_wd_amt_d_cl,
+         G.d30_sum_wd_amt,
+         G.d30_sum_wd_amt_d_cl,
+         G.d60_sum_wd_amt,
+         G.d60_sum_wd_amt_d_cl,
+         G.d90_sum_wd_amt,
+         G.d90_sum_wd_amt_d_cl,
+         G.d120_sum_wd_amtsum,
+         G.d120_sum_wd_amt_d_cl,
+         H.sum_pay_amt,
+         H.sum_pay_amt_d_cl,
+         H.d30_sum_pay_amt,
+         H.d30_sum_pay_amt_d_cl,
+         H.d60_sum_pay_amt,
+         H.d60_sum_pay_amt_d_cl,
+         H.d90_sum_pay_amt,
+         H.d90_sum_pay_amt_d_cl,
+         H.d120_sum_pay_amtsum,
+         H.d120_sum_pay_amt_d_cl,
+         I.观察期内应还月份数,
+         overdue_settle_cnt/sum_loan_cnt AS overdue_settle_D_ALL,
+         normal_cnt /sum_loan_cnt AS normal_cnt_D_ALL,
+         (normal_settle_cnt+settle_in_advance_cnt )/sum_loan_cnt AS nor_N_IDce_settle_D_ALL,
+
+         normal_settle_cnt/观察期内应还月份数 AS AVG_M_normal_settle_cnt,
+         overdue_settle_cnt/观察期内应还月份数 AS AVG_M_overdue_settle_cnt,
+         settle_in_advance_cnt/观察期内应还月份数 AS AVG_M_settle_in_advance_cnt,
+
+         due_sum_total_AMT/观察期内应还月份数 AS due_sum_total_AMT_D_PMONS,
+         due_sum_Wd_AMT/观察期内应还月份数 AS due_sum_Wd_AMT_D_PMONS,
+         due_sum_PAY_AMT/观察期内应还月份数 AS due_sum_PAY_AMT_D_PMONS
+  FROM PQG_B_MODEL_V_1_0_FEAT1_WR A
+    LEFT JOIN PQG_B_MODEL_V_1_0_FEAT2_WR  B ON A.CUSTOMERID=B.CUSTOMERID
+    LEFT JOIN PQG_B_MODEL_V_1_0_FEAT3_WR C ON A.CUSTOMERID=C.CUSTOMERID
+    LEFT JOIN PQG_B_MODEL_V_1_0_FEAT4_WR D ON A.CUSTOMERID=D.CUSTOMERID
+    LEFT JOIN PQG_B_MODEL_V_1_0_FEAT5_WR E ON A.CUSTOMERID=E.CUSTOMERID
+    LEFT JOIN PQG_B_MODEL_V_1_0_FEAT6_WR F ON A.CUSTOMERID=F.CUSTOMERID
+    LEFT JOIN PQG_B_MODEL_V_1_0_FEAT7_WR G ON A.CUSTOMERID=G.CUSTOMERID
+    LEFT JOIN PQG_B_MODEL_V_1_0_FEAT8_WR H ON A.CUSTOMERID=H.CUSTOMERID
+    LEFT JOIN PQG_B_MODEL_V_1_0_FEAT9_WR I ON A.CUSTOMERID=I.CUSTOMERID
+    LEFT JOIN PQG_B_MODEL_V_1_0_SAMPLE_Y_WR J ON A.CUSTOMERID=J.CUSTOMERID;
